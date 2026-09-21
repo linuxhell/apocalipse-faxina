@@ -784,7 +784,14 @@ foreach ($root in $clsidRoots) {
     }
 }
 
-[Console]::Write((ConvertTo-Json -InputObject @($items) -Compress -Depth 6))
+if ($items.Count -eq 0) {
+    [Console]::Write('[]')
+} else {
+    $jsonParts = foreach ($item in $items) {
+        ConvertTo-Json -InputObject $item -Compress -Depth 6
+    }
+    [Console]::Write('[' + ($jsonParts -join ',') + ']')
+}
 "#;
 
         run_json_timeout::<RegistryOrphan>(SCRIPT, Duration::from_secs(30))
