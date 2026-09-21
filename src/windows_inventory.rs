@@ -4,7 +4,7 @@ use std::{
     io::Read,
     path::Path,
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
@@ -355,12 +355,30 @@ foreach ($root in $handlerRoots) {
     }
 
     pub fn poll_registry_scan(&mut self) {
-        let result = self
-            .registry_scan_rx
-            .as_ref()
-            .and_then(|rx| rx.try_recv().ok());
-        let Some(result) = result else {
-            return;
+        let result = match self.registry_scan_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) => return,
+            Some(Err(TryRecvError::Disconnected)) => {
+                let elapsed = self
+                    .registry_scan_started
+                    .take()
+                    .map(|started| started.elapsed().as_millis())
+                    .unwrap_or(0);
+                self.registry_scan_rx = None;
+                self.registry_scanning = false;
+                self.registry_status =
+                    "A Varredura Segura foi encerrada porque o worker terminou inesperadamente; o scanner não ficará preso."
+                        .into();
+                crate::diagnostics::operation_end(
+                    "registro",
+                    "safe_scan",
+                    false,
+                    elapsed,
+                    serde_json::json!({"error":"worker desconectado"}),
+                );
+                return;
+            }
+            None => return,
         };
 
         self.registry_scan_rx = None;

@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::Instant,
 };
@@ -202,9 +202,31 @@ impl MailState {
     }
 
     pub fn poll(&mut self) {
-        let result = self.rx.as_ref().and_then(|rx| rx.try_recv().ok());
-        let Some(result) = result else {
-            return;
+        let result = match self.rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) => return,
+            Some(Err(TryRecvError::Disconnected)) => {
+                let operation = if self.analyzing {
+                    "analyze_thunderbird"
+                } else {
+                    "clean_thunderbird"
+                };
+                self.rx = None;
+                self.analyzing = false;
+                self.cleaning = false;
+                self.status =
+                    "O worker do Thunderbird terminou inesperadamente; a operação foi encerrada para não deixar a interface presa."
+                        .into();
+                crate::diagnostics::operation_end(
+                    "email_portatil",
+                    operation,
+                    false,
+                    0,
+                    serde_json::json!({"error":"worker desconectado"}),
+                );
+                return;
+            }
+            None => return,
         };
         self.rx = None;
 
