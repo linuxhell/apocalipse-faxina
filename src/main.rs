@@ -4,6 +4,7 @@ mod duplicates;
 mod portable_browsers;
 mod residue_scan;
 mod winapp2;
+mod windows_inventory;
 
 use eframe::egui;
 use rodio::Source;
@@ -157,10 +158,10 @@ struct FaxinaApp {
     duplicate_thumbnails: HashMap<String, egui::TextureHandle>,
     drive_target: String,
     driver_inf: String,
-    task_name: String,
+    inventory: windows_inventory::WindowsInventory,
     service_name: String,
     hide_microsoft_services: bool,
-    task_filter: usize,
+    show_windows_shell: bool,
     busy_label: String,
     about_background: Option<egui::TextureHandle>,
     about_creator: Option<egui::TextureHandle>,
@@ -195,10 +196,10 @@ impl FaxinaApp {
             duplicate_thumbnails: HashMap::new(),
             drive_target: "C:".into(),
             driver_inf: String::new(),
-            task_name: String::new(),
+            inventory: windows_inventory::WindowsInventory::default(),
             service_name: String::new(),
             hide_microsoft_services: true,
-            task_filter: 2,
+            show_windows_shell: false,
             busy_label: String::new(),
             about_background,
             about_creator,
@@ -895,20 +896,81 @@ impl FaxinaApp {
     }
 
     fn page_registry(&mut self, ui: &mut egui::Ui) {
-        ui.label("Modo conservador: a primeira versão analisa pontos comuns sem apagar automaticamente chaves sensíveis.");
+        let t = themes()[self.theme_index].clone();
+        ui.label("Scanner conservador: somente referências com alvo inexistente em Run/RunOnce e App Paths. Nenhuma limpeza genérica de 'milhares de erros'.");
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Ver inicialização HKCU").clicked() {
-                self.capture("Registro HKCU", "reg.exe", &["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"]);
+            if ui.button("Analisar órfãos confirmados").clicked() {
+                self.inventory.scan_registry_orphans();
             }
-            if ui.button("Ver inicialização HKLM").clicked() {
-                self.capture("Registro HKLM", "reg.exe", &["query", r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run"]);
+            if ui.button("Marcar todos encontrados").clicked() {
+                for item in &mut self.inventory.registry_orphans {
+                    item.checked = true;
+                }
+            }
+            if ui.button("Desmarcar tudo").clicked() {
+                for item in &mut self.inventory.registry_orphans {
+                    item.checked = false;
+                }
             }
             if ui.button("Abrir Editor do Registro").clicked() {
                 let _ = Command::new("regedit.exe").spawn();
             }
         });
-        ui.label("A limpeza automática estrutural ficará restrita a resíduos comprovados e terá backup/restauração.");
-        output_box(ui, &self.last_output);
+
+        if ui
+            .add_enabled(
+                self.inventory.registry_orphans.iter().any(|x| x.checked),
+                egui::Button::new("Backup + remover selecionados"),
+            )
+            .clicked()
+        {
+            let backup = portable_root()
+                .join("backups")
+                .join("registry")
+                .join(timestamp_slug());
+            match fs::create_dir_all(&backup) {
+                Ok(_) => {
+                    if let Some((command, manifest)) =
+                        self.inventory.registry_cleanup_command(&backup)
+                    {
+                        let _ = fs::write(backup.join("manifesto.txt"), manifest);
+                        self.elevated_cmd("Limpeza conservadora do Registro", &command);
+                        self.last_output.push_str(&format!(
+                            "\n\nBackup .reg e manifesto salvos em:\n{}",
+                            backup.display()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.last_output =
+                        format!("A limpeza não foi iniciada: falha ao criar backup: {error}");
+                }
+            }
+        }
+
+        ui.label(&self.inventory.registry_status);
+        ui.small("Cada chave selecionada é exportada para .reg antes de qualquer remoção. Services, COM e HKLM\\SYSTEM não entram neste scanner.");
+        ui.separator();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for item in &mut self.inventory.registry_orphans {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut item.checked, "");
+                    ui.vertical(|ui| {
+                        ui.strong(&item.reason);
+                        ui.small(&item.reg_path);
+                        if !item.value_name.is_empty() {
+                            ui.small(format!("Valor: {}", item.value_name));
+                        }
+                        ui.small(
+                            egui::RichText::new(format!("Alvo inexistente: {}", item.target))
+                                .color(t.muted),
+                        );
+                    });
+                });
+                ui.separator();
+            }
+        });
     }
 
     fn page_startup(&mut self, ui: &mut egui::Ui) {
@@ -920,37 +982,68 @@ impl FaxinaApp {
     }
 
     fn page_tasks(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Exibir:");
-            egui::ComboBox::from_id_salt("task_filter").selected_text(match self.task_filter {1=>"Criadas pelo usuário",2=>"Criadas por programas",3=>"Microsoft / Windows",_=>"Todas"}).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.task_filter,0,"Todas");
-                ui.selectable_value(&mut self.task_filter,1,"Criadas pelo usuário");
-                ui.selectable_value(&mut self.task_filter,2,"Criadas por programas");
-                ui.selectable_value(&mut self.task_filter,3,"Microsoft / Windows");
-            });
-            if ui.button("Atualizar").clicked() {
-                let cmd = match self.task_filter {
-                    3 => "Get-ScheduledTask | Where-Object TaskPath -like '\\\\Microsoft\\\\*' | Select TaskPath,TaskName,State | Format-Table -AutoSize | Out-String -Width 240",
-                    1 => "Get-ScheduledTask | Where-Object {$_.Author -and $_.TaskPath -notlike '\\\\Microsoft\\\\*'} | Select TaskPath,TaskName,Author,State | Format-Table -AutoSize | Out-String -Width 240",
-                    2 => "Get-ScheduledTask | Where-Object {$_.TaskPath -notlike '\\\\Microsoft\\\\*'} | Select TaskPath,TaskName,Author,State | Format-Table -AutoSize | Out-String -Width 240",
-                    _ => "Get-ScheduledTask | Select TaskPath,TaskName,Author,State | Format-Table -AutoSize | Out-String -Width 240",
-                };
-                self.capture("Tarefas", "powershell.exe", &["-NoProfile","-Command",cmd]);
+        let t = themes()[self.theme_index].clone();
+        ui.label("Mostra somente tarefas criadas pelo usuário ou por programas. A árvore \\Microsoft\\ do Windows fica escondida.");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Atualizar lista").clicked() {
+                self.inventory.scan_tasks();
+            }
+            if ui.button("Marcar todas").clicked() {
+                for task in &mut self.inventory.tasks {
+                    task.checked = true;
+                }
+            }
+            if ui.button("Desmarcar todas").clicked() {
+                for task in &mut self.inventory.tasks {
+                    task.checked = false;
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.inventory.tasks.iter().any(|x| x.checked),
+                    egui::Button::new("Desativar selecionadas"),
+                )
+                .clicked()
+            {
+                if let Some(command) = self.inventory.task_action_command(false) {
+                    self.elevated_cmd("Desativar tarefas selecionadas", &command);
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.inventory.tasks.iter().any(|x| x.checked),
+                    egui::Button::new("Ativar selecionadas"),
+                )
+                .clicked()
+            {
+                if let Some(command) = self.inventory.task_action_command(true) {
+                    self.elevated_cmd("Ativar tarefas selecionadas", &command);
+                }
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Caminho/nome exato:");
-            ui.text_edit_singleline(&mut self.task_name);
-            if ui.button("Ativar").clicked() {
-                let n = ps_quote(self.task_name.trim());
-                self.elevated_cmd("Ativar tarefa", &format!("powershell -NoProfile -Command \"Enable-ScheduledTask -TaskName '{}'\"", n));
-            }
-            if ui.button("Desativar").clicked() {
-                let n = ps_quote(self.task_name.trim());
-                self.elevated_cmd("Desativar tarefa", &format!("powershell -NoProfile -Command \"Disable-ScheduledTask -TaskName '{}'\"", n));
+        ui.label(&self.inventory.task_status);
+        ui.separator();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for task in &mut self.inventory.tasks {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut task.checked, "");
+                    ui.vertical(|ui| {
+                        ui.strong(&task.task_name);
+                        ui.small(format!(
+                            "{} • {} • {}",
+                            task.task_path,
+                            if task.author.is_empty() { "autor não informado" } else { &task.author },
+                            task.state
+                        ));
+                        if !task.actions.is_empty() {
+                            ui.small(egui::RichText::new(&task.actions).color(t.muted));
+                        }
+                    });
+                });
+                ui.separator();
             }
         });
-        output_box(ui, &self.last_output);
     }
 
     fn page_services(&mut self, ui: &mut egui::Ui) {
@@ -975,13 +1068,84 @@ impl FaxinaApp {
     }
 
     fn page_shell(&mut self, ui: &mut egui::Ui) {
-        ui.label("Gerenciador do menu de contexto do Explorer. A versão inicial enumera as áreas principais antes de permitir alterações.");
+        let t = themes()[self.theme_index].clone();
+        ui.label("Gerencia entradas estáticas e extensões do menu de contexto. Itens identificados como Windows/Microsoft ficam ocultos por padrão.");
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Itens de arquivos").clicked() { self.capture("Shell arquivos","reg.exe",&["query",r"HKCR\*\shell","/s"]); }
-            if ui.button("Itens de pastas").clicked() { self.capture("Shell diretórios","reg.exe",&["query",r"HKCR\Directory\shell","/s"]); }
-            if ui.button("Background da pasta").clicked() { self.capture("Shell background","reg.exe",&["query",r"HKCR\Directory\Background\shell","/s"]); }
+            if ui.button("Atualizar itens").clicked() {
+                self.inventory.scan_shell();
+            }
+            ui.checkbox(&mut self.show_windows_shell, "Mostrar itens do Windows");
+            if ui.button("Marcar visíveis").clicked() {
+                for item in &mut self.inventory.shell {
+                    if self.show_windows_shell || !item.is_windows {
+                        item.checked = true;
+                    }
+                }
+            }
+            if ui.button("Desmarcar todos").clicked() {
+                for item in &mut self.inventory.shell {
+                    item.checked = false;
+                }
+            }
         });
-        output_box(ui, &self.last_output);
+
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    self.inventory.shell.iter().any(|x| x.checked),
+                    egui::Button::new("Desativar selecionados"),
+                )
+                .clicked()
+            {
+                if let Some(command) = self.inventory.shell_action_command(false) {
+                    self.elevated_cmd("Desativar menu de contexto", &command);
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.inventory.shell.iter().any(|x| x.checked),
+                    egui::Button::new("Ativar selecionados"),
+                )
+                .clicked()
+            {
+                if let Some(command) = self.inventory.shell_action_command(true) {
+                    self.elevated_cmd("Ativar menu de contexto", &command);
+                }
+            }
+        });
+        ui.label(&self.inventory.shell_status);
+        ui.small("Entradas shell usam LegacyDisable; handlers COM usam a lista reversível Shell Extensions\\Blocked.");
+        ui.separator();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for item in &mut self.inventory.shell {
+                if item.is_windows && !self.show_windows_shell {
+                    continue;
+                }
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut item.checked, "");
+                    ui.vertical(|ui| {
+                        ui.strong(&item.name);
+                        ui.small(format!(
+                            "{} • {} • {}",
+                            item.context,
+                            item.kind,
+                            if item.enabled { "Ativo" } else { "Desativado" }
+                        ));
+                        if !item.company.is_empty() {
+                            ui.small(
+                                egui::RichText::new(format!("Fabricante: {}", item.company))
+                                    .color(t.muted),
+                            );
+                        }
+                        if !item.command.is_empty() {
+                            ui.small(egui::RichText::new(&item.command).color(t.muted));
+                        }
+                    });
+                });
+                ui.separator();
+            }
+        });
     }
 
     fn page_repair_windows(&mut self, ui: &mut egui::Ui) {
@@ -1402,6 +1566,28 @@ fn open_default(path: &Path) {
 fn open_in_folder(path: &Path) {
     let argument = format!("/select,{}", path.display());
     let _ = Command::new("explorer.exe").arg(argument).spawn();
+}
+
+
+fn timestamp_slug() -> String {
+    let raw = run_capture(
+        "powershell.exe",
+        &["-NoProfile", "-Command", "Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'"],
+    );
+    let value: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    if value.len() >= 10 {
+        value
+    } else {
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("backup-{seconds}")
+    }
 }
 
 fn metric(ui: &mut egui::Ui, title: &str, value: String, accent: egui::Color32) {
