@@ -39,6 +39,13 @@ jobs:
           Invoke-WebRequest -Uri "https://raw.githubusercontent.com/linuxhell/apocalipse-download-manager/main/apps/desktop/src-tauri/assets/about-creator.jpg" -OutFile dist\Apocalipse-Faxina\assets\about-creator.jpg
           Invoke-WebRequest -Uri "https://raw.githubusercontent.com/linuxhell/apocalipse-download-manager/main/apps/desktop/src-tauri/assets/about-theme.mp4" -OutFile dist\Apocalipse-Faxina\assets\about-theme.mp4
           if ((Get-Item dist\Apocalipse-Faxina\assets\about-theme.mp4).Length -lt 100000) { throw "Falha ao obter a musica da secao Sobre" }
+          $ffmpeg = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+          if (-not $ffmpeg) {
+            choco install ffmpeg -y --no-progress
+            $ffmpeg = Get-Command ffmpeg.exe -ErrorAction Stop
+          }
+          & $ffmpeg.Source -y -i dist\Apocalipse-Faxina\assets\about-theme.mp4 -vn -codec:a libmp3lame -b:a 128k dist\Apocalipse-Faxina\assets\about-theme.mp3
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path dist\Apocalipse-Faxina\assets\about-theme.mp3)) { throw "Falha ao preparar MP3 da secao Sobre" }
           Set-Content -Encoding UTF8 dist\Apocalipse-Faxina\data\LEIA-ME.txt "Coloque winapp2.ini nesta pasta para carregar as regras Winapp2, ou selecione outro arquivo dentro do programa."
 
       - name: Artefato Windows x64 portátil

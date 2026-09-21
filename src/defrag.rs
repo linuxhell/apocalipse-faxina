@@ -61,7 +61,13 @@ impl DefragState{
    Event::Progress(p,d,ph)=>{self.progress=p;self.current_drive=d;self.phase=ph;}
    Event::Before(s)=>{let drive=s.info.drive.clone();if let Some(r)=self.reports.iter_mut().find(|r|r.drive==drive){r.before=s;r.status="Análise antes concluída".into();}else{self.reports.push(DriveReport{drive,before:s,after:None,status:"Análise concluída".into()});}}
    Event::After(s)=>{let drive=s.info.drive.clone();if let Some(r)=self.reports.iter_mut().find(|r|r.drive==drive){r.after=Some(s);r.status="Otimização e medição concluídas".into();}}
-   Event::Output(o)=>{if !self.output.is_empty(){self.output.push('\n');}self.output.push_str(&o);}
+   Event::Output(o)=>{
+    let cleaned=clean_technical_output(&o);
+    if !cleaned.trim().is_empty(){
+        if !self.output.is_empty(){self.output.push('\n');}
+        self.output.push_str(&cleaned);
+    }
+}
    Event::Finished(s)=>{self.running=false;self.rx=None;self.progress=100.0;self.phase="Concluído".into();self.status=s;}
    Event::Failed(s)=>{self.running=false;self.rx=None;self.phase="Falha".into();self.status=s.clone();crate::diagnostics::event("disk_error","Falha em discos",json!({"error":s}));}
    Event::Cancelled=>{self.running=false;self.rx=None;self.phase="Interrompido".into();self.status="Operação interrompida.".into();}
@@ -94,6 +100,17 @@ fn run_multi(drives:Vec<String>,mode:Option<OptimizationMode>,tx:Sender<Event>,c
  }
  crate::diagnostics::operation_end("disks",if mode.is_some(){"optimize_multi"}else{"analyze_multi"},true,started.elapsed().as_millis(),json!({"drives":drives}));
  let _=tx.send(Event::Finished(format!("{} unidade(s) concluída(s).",drives.len())));
+}
+
+fn clean_technical_output(output:&str)->String{
+    output.lines()
+        .filter(|line|{
+            let lower=line.to_ascii_lowercase();
+            !lower.contains("invocando otimizar novamente")
+                && !lower.contains("invoking optimization again")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn validate_mode(mode:OptimizationMode,info:&VolumeInfo)->Result<(),String>{

@@ -184,6 +184,7 @@ struct FaxinaApp {
     about_audio: Option<AboutAudio>,
     about_volume: f32,
     diagnostic_export: diagnostics::ExportState,
+    startup_opacity_pending: bool,
 }
 
 impl FaxinaApp {
@@ -229,6 +230,7 @@ impl FaxinaApp {
             about_audio: None,
             about_volume: 0.70,
             diagnostic_export: diagnostics::ExportState::default(),
+            startup_opacity_pending: true,
         };
         app.apply_theme(&cc.egui_ctx);
         set_window_opacity(app.transparency);
@@ -1100,7 +1102,12 @@ impl FaxinaApp {
         }
 
         if !self.defrag.output.trim().is_empty() {
-            egui::CollapsingHeader::new("Saída detalhada do Windows").show(ui, |ui| output_box(ui, &self.defrag.output));
+            egui::CollapsingHeader::new("Log técnico do defrag.exe (opcional)")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.small("O Windows pode relatar internamente que está 'invocando otimizar novamente' ao executar /O. Isso faz parte da estratégia escolhida pelo próprio defrag.exe e não significa que o Faxina enviou a unidade duas vezes.");
+                    output_box(ui, &self.defrag.output);
+                });
         }
     
             });
@@ -1155,7 +1162,7 @@ impl FaxinaApp {
             if ui.add_enabled(!self.winsxs.running, egui::Button::new("Limpar Component Store + medir ganho")).clicked() {
                 self.winsxs.cleanup(false);
             }
-            if ui.add_enabled(!self.winsxs.running, egui::Button::new("ResetBase + medir ganho (irreversível)")).clicked() {
+            if ui.add_enabled(!self.winsxs.running, egui::Button::new("Limpar ResetBase + medir ganho (irreversível)")).clicked() {
                 self.winsxs.cleanup(true);
             }
         });
@@ -2256,7 +2263,13 @@ impl FaxinaApp {
 
     fn restart_about_audio(&mut self) {
         self.stop_about_audio();
-        let path = portable_root().join("assets").join("about-theme.mp4");
+        let assets = portable_root().join("assets");
+        let mp3 = assets.join("about-theme.mp3");
+        let path = if mp3.is_file() {
+            mp3
+        } else {
+            assets.join("about-theme.mp4")
+        };
         diagnostics::event(
             "about_audio",
             "Iniciando áudio da seção Sobre pelo mecanismo multimídia do Windows",
@@ -2306,10 +2319,29 @@ impl FaxinaApp {
     }
 }
 
+impl Drop for FaxinaApp {
+    fn drop(&mut self) {
+        save_settings(self.theme_index, self.transparency);
+        self.stop_about_audio();
+        diagnostics::event(
+            "session_end",
+            "Apocalipse Faxina encerrado com aparência persistida",
+            serde_json::json!({
+                "theme": self.theme_index,
+                "transparency": self.transparency
+            }),
+        );
+    }
+}
+
 impl eframe::App for FaxinaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_started=std::time::Instant::now();
         self.apply_theme(ctx);
+        if self.startup_opacity_pending {
+            set_window_opacity(self.transparency);
+            self.startup_opacity_pending = false;
+        }
         let t = themes()[self.theme_index].clone();
         let section_before_nav = self.section;
         egui::SidePanel::left("nav").exact_width(235.0).frame(egui::Frame::new().fill(t.panel).inner_margin(egui::Margin::same(12))).show(ctx, |ui| {
@@ -2457,9 +2489,18 @@ try {{
   Add-Type -AssemblyName PresentationCore
   $player = New-Object System.Windows.Media.MediaPlayer
   $player.Open([Uri]::new($mediaPath))
+  $deadline=(Get-Date).AddSeconds(6)
+  while((Get-Date) -lt $deadline -and -not $player.NaturalDuration.HasTimeSpan -and -not $player.HasAudio) {{
+    Start-Sleep -Milliseconds 80
+  }}
+  if(-not $player.HasAudio -and -not $player.NaturalDuration.HasTimeSpan) {{
+    throw "O mecanismo multimídia do Windows não conseguiu abrir o áudio dentro do tempo limite."
+  }}
+  $player.Position=[TimeSpan]::Zero
   $player.Volume = [double]::Parse('{volume:.4}', [Globalization.CultureInfo]::InvariantCulture)
   $player.Play()
-  Set-Content -LiteralPath $statusPath -Value 'playing' -Encoding UTF8
+  Start-Sleep -Milliseconds 120
+  Set-Content -LiteralPath $statusPath -Value ('playing|' + $mediaPath) -Encoding UTF8
   $last=''
   while($true) {{
     if(Test-Path -LiteralPath $controlPath) {{
@@ -2760,17 +2801,121 @@ fn config_dir() -> PathBuf {
 }
 
 fn load_settings() -> (usize, u8) {
-    let p = config_dir().join("appearance.txt");
-    if let Ok(s) = fs::read_to_string(p) {
-        let mut it = s.lines();
-        let a = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-        let b = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-        (a,b)
-    } else { (0,0) }
+    let portable = config_dir().join("appearance.txt");
+    let fallback = env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|root| root.join("ApocalipseFaxina").join("appearance.txt"));
+
+    for path in std::iter::once(Some(portable.clone()))
+        .chain(std::iter::once(fallback.clone()))
+        .flatten()
+    {
+        if let Ok(text) = fs::read_to_string(&path) {
+            let mut lines = text.lines();
+            if let (Some(theme), Some(transparency)) = (
+                lines.next().and_then(|value| value.trim().parse::<usize>().ok()),
+                lines.next().and_then(|value| value.trim().parse::<u8>().ok()),
+            ) {
+                diagnostics::event(
+                    "appearance_load",
+                    "Aparência carregada",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "theme": theme,
+                        "transparency": transparency
+                    }),
+                );
+                return (theme, transparency.min(45));
+            }
+        }
+    }
+
+    diagnostics::event(
+        "appearance_load",
+        "Nenhuma configuração de aparência válida encontrada; usando padrão",
+        serde_json::json!({"portable_path": portable.to_string_lossy()}),
+    );
+    (0, 0)
 }
 
 fn save_settings(theme: usize, transparency: u8) {
-    let _ = fs::write(config_dir().join("appearance.txt"), format!("{theme}\n{transparency}\n"));
+    fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Caminho de configuração sem diretório pai.".to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Falha ao criar {}: {error}", parent.display()))?;
+
+        let temp = path.with_extension("tmp");
+        {
+            let mut file = fs::File::create(&temp)
+                .map_err(|error| format!("Falha ao criar {}: {error}", temp.display()))?;
+            use std::io::Write;
+            file.write_all(content.as_bytes())
+                .map_err(|error| format!("Falha ao gravar {}: {error}", temp.display()))?;
+            file.flush()
+                .map_err(|error| format!("Falha ao finalizar {}: {error}", temp.display()))?;
+            let _ = file.sync_all();
+        }
+
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+        fs::rename(&temp, path)
+            .map_err(|error| format!("Falha ao substituir {}: {error}", path.display()))?;
+        Ok(())
+    }
+
+    let content = format!("{}\n{}\n", theme, transparency.min(45));
+    let portable = config_dir().join("appearance.txt");
+
+    match write_atomic(&portable, &content) {
+        Ok(()) => {
+            diagnostics::event(
+                "appearance_save",
+                "Aparência salva no modo portátil",
+                serde_json::json!({
+                    "path": portable.to_string_lossy(),
+                    "theme": theme,
+                    "transparency": transparency.min(45)
+                }),
+            );
+        }
+        Err(portable_error) => {
+            let fallback = env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .map(|root| root.join("ApocalipseFaxina").join("appearance.txt"));
+
+            if let Some(path) = fallback {
+                match write_atomic(&path, &content) {
+                    Ok(()) => diagnostics::event(
+                        "appearance_save",
+                        "Aparência salva no fallback do usuário",
+                        serde_json::json!({
+                            "path": path.to_string_lossy(),
+                            "theme": theme,
+                            "transparency": transparency.min(45),
+                            "portable_error": portable_error
+                        }),
+                    ),
+                    Err(fallback_error) => diagnostics::event(
+                        "appearance_save_error",
+                        "Falha ao persistir aparência",
+                        serde_json::json!({
+                            "portable_error": portable_error,
+                            "fallback_error": fallback_error
+                        }),
+                    ),
+                }
+            } else {
+                diagnostics::event(
+                    "appearance_save_error",
+                    "Falha ao persistir aparência",
+                    serde_json::json!({"portable_error": portable_error}),
+                );
+            }
+        }
+    }
 }
 
 fn default_exclusions() -> Vec<String> {
