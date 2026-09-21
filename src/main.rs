@@ -2,7 +2,6 @@
 
 use eframe::egui;
 use std::{
-    collections::HashSet,
     env,
     fs,
     path::{Path, PathBuf},
@@ -653,7 +652,7 @@ fn output_box(ui: &mut egui::Ui, output: &str) {
 }
 
 fn blend(a: egui::Color32, b: egui::Color32, k: f32) -> egui::Color32 {
-    let mix = |x:u8,y:u8| ((x as f32*(1.0-k)+y as f32*k).round() as u8);
+    let mix = |x:u8,y:u8| (x as f32*(1.0-k)+y as f32*k).round() as u8;
     egui::Color32::from_rgb(mix(a.r(),b.r()),mix(a.g(),b.g()),mix(a.b(),b.b()))
 }
 
@@ -721,7 +720,7 @@ fn dir_size(path: &Path, exclusions: &[String]) -> u64 {
     let meta = match fs::symlink_metadata(path) { Ok(m)=>m, Err(_)=>return 0 };
     if meta.file_type().is_symlink() { return 0; }
     if meta.is_file() { return meta.len(); }
-    let mut total = 0;
+    let mut total: u64 = 0;
     if let Ok(rd) = fs::read_dir(path) {
         for e in rd.flatten() { total = total.saturating_add(dir_size(&e.path(), exclusions)); }
     }
