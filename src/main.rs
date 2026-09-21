@@ -3,6 +3,7 @@
 mod duplicates;
 mod portable_browsers;
 mod residue_scan;
+mod startup;
 mod winapp2;
 mod windows_inventory;
 
@@ -159,6 +160,7 @@ struct FaxinaApp {
     drive_target: String,
     driver_inf: String,
     inventory: windows_inventory::WindowsInventory,
+    startup: startup::StartupState,
     service_name: String,
     hide_microsoft_services: bool,
     show_windows_shell: bool,
@@ -197,6 +199,7 @@ impl FaxinaApp {
             drive_target: "C:".into(),
             driver_inf: String::new(),
             inventory: windows_inventory::WindowsInventory::default(),
+            startup: startup::StartupState::default(),
             service_name: String::new(),
             hide_microsoft_services: true,
             show_windows_shell: false,
@@ -974,11 +977,74 @@ impl FaxinaApp {
     }
 
     fn page_startup(&mut self, ui: &mut egui::Ui) {
-        ui.label("Lista programas configurados para iniciar com o Windows.");
-        if ui.button("Atualizar lista").clicked() {
-            self.capture("Inicialização", "powershell.exe", &["-NoProfile","-Command","Get-CimInstance Win32_StartupCommand | Select-Object Name,Command,Location,User | Format-Table -AutoSize | Out-String -Width 240"]);
-        }
-        output_box(ui, &self.last_output);
+        let t = themes()[self.theme_index].clone();
+        ui.label("Gerenciador reversível de programas que iniciam com o Windows. Desativar não apaga a entrada original.");
+        ui.small("Analisa Run/RunOnce de usuário e máquina, 32/64-bit e as pastas Inicializar. O estado é controlado por StartupApproved.");
+
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Atualizar lista").clicked() {
+                self.startup.scan();
+            }
+            if ui.button("Marcar todos").clicked() {
+                self.startup.set_all_checked(true);
+            }
+            if ui.button("Desmarcar todos").clicked() {
+                self.startup.set_all_checked(false);
+            }
+            if ui
+                .add_enabled(
+                    self.startup.entries.iter().any(|x| x.checked),
+                    egui::Button::new("Desativar selecionados"),
+                )
+                .clicked()
+            {
+                if let Some(command) = self.startup.selected_action_command(false) {
+                    self.elevated_cmd("Desativar inicialização", &command);
+                    self.startup.apply_local_state(false);
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.startup.entries.iter().any(|x| x.checked),
+                    egui::Button::new("Ativar selecionados"),
+                )
+                .clicked()
+            {
+                if let Some(command) = self.startup.selected_action_command(true) {
+                    self.elevated_cmd("Ativar inicialização", &command);
+                    self.startup.apply_local_state(true);
+                }
+            }
+        });
+
+        ui.label(&self.startup.status);
+        ui.separator();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for entry in &mut self.startup.entries {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut entry.checked, "");
+                    ui.vertical(|ui| {
+                        ui.strong(&entry.name);
+                        ui.small(format!(
+                            "{} • {}",
+                            entry.location,
+                            if entry.enabled { "Ativo" } else { "Desativado" }
+                        ));
+                        if !entry.company.is_empty() {
+                            ui.small(
+                                egui::RichText::new(format!("Fabricante: {}", entry.company))
+                                    .color(t.muted),
+                            );
+                        }
+                        if !entry.command.is_empty() {
+                            ui.small(egui::RichText::new(&entry.command).color(t.muted));
+                        }
+                    });
+                });
+                ui.separator();
+            }
+        });
     }
 
     fn page_tasks(&mut self, ui: &mut egui::Ui) {
