@@ -4,6 +4,7 @@ use std::{
     env,
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use walkdir::WalkDir;
 
@@ -74,6 +75,7 @@ pub struct WinappAnalysis {
     pub size: u64,
     pub files: Vec<PathBuf>,
     pub checked: bool,
+    pub failures: Vec<String>,
 }
 
 pub struct Winapp2State {
@@ -87,14 +89,27 @@ pub struct Winapp2State {
 
 impl Winapp2State {
     pub fn load(portable_root: &Path, config_dir: &Path) -> Self {
-        let default_path = portable_root.join("data").join("winapp2.ini");
-        let saved_path = fs::read_to_string(config_dir.join("winapp2-path.txt"))
-            .ok()
-            .map(|s| PathBuf::from(s.trim()))
-            .filter(|p| !p.as_os_str().is_empty());
+        let data_dir = portable_root.join("data");
+        let _ = fs::create_dir_all(&data_dir);
+        let internal_path = data_dir.join("winapp2.ini");
+
+        if !internal_path.exists() {
+            if let Ok(saved) = fs::read_to_string(config_dir.join("winapp2-path.txt")) {
+                let legacy = PathBuf::from(saved.trim());
+                if legacy.is_file() && legacy != internal_path {
+                    let _ = fs::copy(&legacy, &internal_path);
+                }
+            }
+        }
+
+        let update_note = update_internal_copy(&internal_path);
+        let _ = fs::write(
+            config_dir.join("winapp2-path.txt"),
+            internal_path.to_string_lossy().as_bytes(),
+        );
 
         let mut state = Self {
-            path: saved_path.unwrap_or(default_path),
+            path: internal_path,
             rules: Vec::new(),
             status: "Winapp2.ini ainda não carregado".into(),
             filter: String::new(),
@@ -102,16 +117,48 @@ impl Winapp2State {
             analysis_status: String::new(),
         };
         state.reload(config_dir);
+        if !update_note.is_empty() {
+            state.status.push_str(" • ");
+            state.status.push_str(&update_note);
+        }
         state
     }
 
     pub fn load_path(&mut self, path: PathBuf, config_dir: &Path) {
-        self.path = path;
-        let _ = fs::write(
-            config_dir.join("winapp2-path.txt"),
-            self.path.to_string_lossy().as_bytes(),
-        );
-        self.reload(config_dir);
+        let destination = self.path.clone();
+        if path == destination {
+            self.reload(config_dir);
+            return;
+        }
+
+        if let Some(parent) = destination.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        match fs::copy(&path, &destination) {
+            Ok(_) => {
+                let _ = fs::write(
+                    config_dir.join("winapp2-path.txt"),
+                    destination.to_string_lossy().as_bytes(),
+                );
+                self.reload(config_dir);
+                self.status = format!(
+                    "Winapp2.ini importado de {} e copiado para {} • {} regras • {} selecionadas",
+                    path.display(),
+                    destination.display(),
+                    self.rules.len(),
+                    self.selected_count()
+                );
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Não foi possível copiar {} para {}: {}",
+                    path.display(),
+                    destination.display(),
+                    error
+                );
+            }
+        }
     }
 
     pub fn reload(&mut self, config_dir: &Path) {
@@ -136,6 +183,15 @@ impl Winapp2State {
                     error
                 );
             }
+        }
+    }
+
+    pub fn check_update(&mut self, config_dir: &Path) {
+        let note = update_internal_copy(&self.path);
+        self.reload(config_dir);
+        if !note.is_empty() {
+            self.status.push_str(" • ");
+            self.status.push_str(&note);
         }
     }
 
@@ -240,6 +296,7 @@ impl Winapp2State {
                     size,
                     files,
                     checked: true,
+                    failures: Vec::new(),
                 });
             }
 
@@ -283,18 +340,24 @@ impl Winapp2State {
             if !selected_rules.contains(&group.rule_name) {
                 continue;
             }
+            group.failures.clear();
             let Some(rule) = rules_by_name.get(group.rule_name.as_str()).copied() else {
                 continue;
             };
+
             for path in &group.files {
                 if is_excluded(path, global_exclusions) || is_rule_excluded(path, rule) {
                     continue;
                 }
                 let before = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                if fs::remove_file(path).is_ok() {
-                    removed = removed.saturating_add(before);
+                match fs::remove_file(path) {
+                    Ok(_) => removed = removed.saturating_add(before),
+                    Err(error) => group
+                        .failures
+                        .push(format!("{}: {}", path.display(), error)),
                 }
             }
+
             group.files.retain(|path| path.exists());
             group.file_count = group.files.len();
             group.size = group
@@ -304,11 +367,14 @@ impl Winapp2State {
                 .sum();
         }
 
-        self.analysis.retain(|group| !group.files.is_empty());
+        self.analysis.retain(|group| {
+            !group.checked || !group.files.is_empty() || !group.failures.is_empty()
+        });
+        let failed: usize = self.analysis.iter().map(|group| group.failures.len()).sum();
         self.analysis_status = format!(
-            "Limpeza Winapp2 concluída • {} liberados • {} grupos ainda possuem arquivos. RegKey não foi executado.",
+            "Limpeza Winapp2 concluída • {} liberados • {} arquivo(s) não removidos • RegKey não foi executado",
             fmt_bytes(removed),
-            self.analysis.len()
+            failed
         );
         removed
     }
@@ -350,6 +416,77 @@ impl Winapp2State {
     }
 }
 
+
+const WINAPP2_UPDATE_URL: &str =
+    "https://raw.githubusercontent.com/MoscaDotTo/Winapp2/master/Non-CCleaner/BleachBit/Winapp2.ini";
+
+fn parse_version(content: &str) -> Option<u64> {
+    content.lines().take(20).find_map(|line| {
+        let line = line.trim();
+        let value = line.strip_prefix("; Version:")?.trim();
+        value.parse::<u64>().ok()
+    })
+}
+
+fn update_internal_copy(path: &Path) -> String {
+    let local_content = fs::read_to_string(path).ok();
+    let local_version = local_content.as_deref().and_then(parse_version);
+
+    let response = match ureq::get(WINAPP2_UPDATE_URL)
+        .timeout(Duration::from_secs(5))
+        .call()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return if path.exists() {
+                format!("Atualização online indisponível; cópia local preservada ({error})")
+            } else {
+                format!("Não foi possível obter Winapp2.ini ({error})")
+            };
+        }
+    };
+
+    let remote = match response.into_string() {
+        Ok(content) => content,
+        Err(error) => return format!("Falha ao ler atualização do Winapp2.ini: {error}"),
+    };
+    let remote_version = parse_version(&remote);
+
+    let should_replace = if !path.exists() {
+        true
+    } else {
+        match (local_version, remote_version) {
+            (Some(local), Some(remote)) => remote > local,
+            // Arquivo personalizado sem versão é preservado para não destruir
+            // alterações locais feitas pelo usuário.
+            (None, _) => false,
+            _ => false,
+        }
+    };
+
+    if !should_replace {
+        return match (local_version, remote_version) {
+            (Some(local), Some(remote)) if remote <= local => {
+                format!("Winapp2.ini já está atualizado (v{local})")
+            }
+            (None, _) => "Arquivo personalizado preservado; versão não identificada".into(),
+            _ => "Cópia local preservada".into(),
+        };
+    }
+
+    if let Some(parent) = path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return format!("Falha ao preparar pasta data: {error}");
+        }
+    }
+    match fs::write(path, remote.as_bytes()) {
+        Ok(_) => match remote_version {
+            Some(version) => format!("Winapp2.ini atualizado automaticamente para v{version}"),
+            None => "Winapp2.ini atualizado automaticamente".into(),
+        },
+        Err(error) => format!("Falha ao salvar atualização Winapp2.ini: {error}"),
+    }
+}
 
 fn resolve_file_key(
     file_key: &str,

@@ -43,6 +43,7 @@ pub struct BrowserItem {
     pub path: PathBuf,
     pub size: u64,
     pub checked: bool,
+    pub error: Option<String>,
 }
 
 pub struct BrowserState {
@@ -127,6 +128,7 @@ impl BrowserState {
                         path,
                         size,
                         checked: true,
+                        error: None,
                     });
                 }
             }
@@ -160,16 +162,34 @@ impl BrowserState {
     pub fn clean_selected(&mut self, exclusions: &[String]) -> u64 {
         let mut removed = 0u64;
         for item in self.items.iter_mut().filter(|item| item.checked) {
+            item.error = None;
             let before = item.size;
-            clean_directory_contents(&item.path, exclusions);
+            let failures = clean_directory_contents_report(&item.path, exclusions);
             let after = dir_size(&item.path, exclusions);
             removed = removed.saturating_add(before.saturating_sub(after));
             item.size = after;
+            if after > 0 {
+                item.error = Some(if failures.is_empty() {
+                    "Arquivos permaneceram ou foram recriados pelo navegador.".into()
+                } else if failures.len() == 1 {
+                    failures[0].clone()
+                } else {
+                    format!("{} falhas; primeira: {}", failures.len(), failures[0])
+                });
+            }
         }
+
+        self.items
+            .retain(|item| !item.checked || item.size > 0 || item.error.is_some());
+        let failed = self
+            .items
+            .iter()
+            .filter(|item| item.checked && item.error.is_some())
+            .count();
         self.status = format!(
-            "Limpeza dos navegadores concluída • liberado {} • restante selecionado {}",
+            "Limpeza dos navegadores concluída • liberado {} • {} área(s) permaneceram",
             fmt_bytes(removed),
-            fmt_bytes(self.items.iter().filter(|x| x.checked).map(|x| x.size).sum())
+            failed
         );
         removed
     }
@@ -309,36 +329,60 @@ fn dir_size(path: &Path, exclusions: &[String]) -> u64 {
     total
 }
 
-fn clean_directory_contents(path: &Path, exclusions: &[String]) {
-    if is_excluded(path, exclusions) {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let child = entry.path();
-        if is_excluded(&child, exclusions) {
-            continue;
+fn clean_directory_contents_report(path: &Path, exclusions: &[String]) -> Vec<String> {
+    fn visit(path: &Path, exclusions: &[String], failures: &mut Vec<String>) {
+        if is_excluded(path, exclusions) {
+            return;
         }
-        let Ok(meta) = fs::symlink_metadata(&child) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if meta.is_dir() {
-            clean_directory_contents(&child, exclusions);
-            let empty = fs::read_dir(&child)
-                .map(|mut it| it.next().is_none())
-                .unwrap_or(false);
-            if empty {
-                let _ = fs::remove_dir(&child);
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                failures.push(format!("{}: {}", path.display(), error));
+                return;
             }
-        } else {
-            let _ = fs::remove_file(&child);
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    failures.push(format!("Falha ao ler item: {error}"));
+                    continue;
+                }
+            };
+            let child = entry.path();
+            if is_excluded(&child, exclusions) {
+                continue;
+            }
+            let meta = match fs::symlink_metadata(&child) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    failures.push(format!("{}: {}", child.display(), error));
+                    continue;
+                }
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                visit(&child, exclusions, failures);
+                match fs::read_dir(&child) {
+                    Ok(mut left) if left.next().is_none() => {
+                        if let Err(error) = fs::remove_dir(&child) {
+                            failures.push(format!("{}: {}", child.display(), error));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => failures.push(format!("{}: {}", child.display(), error)),
+                }
+            } else if let Err(error) = fs::remove_file(&child) {
+                failures.push(format!("{}: {}", child.display(), error));
+            }
         }
     }
+
+    let mut failures = Vec::new();
+    visit(path, exclusions, &mut failures);
+    failures
 }
 
 fn fmt_bytes(value: u64) -> String {

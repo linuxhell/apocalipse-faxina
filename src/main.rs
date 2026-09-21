@@ -10,7 +10,6 @@ mod windows_inventory;
 mod winsxs;
 
 use eframe::egui;
-use rodio::Source;
 use std::{
     collections::HashMap,
     env,
@@ -144,6 +143,7 @@ struct CleanItem {
     path: PathBuf,
     size: u64,
     checked: bool,
+    error: Option<String>,
 }
 
 struct FaxinaApp {
@@ -252,7 +252,7 @@ impl FaxinaApp {
             if !path.exists() || is_excluded(&path, &exclusions) { continue; }
             let size = dir_size(&path, &exclusions);
             if size > 0 {
-                items.push(CleanItem { name: name.into(), path, size, checked: true });
+                items.push(CleanItem { name: name.into(), path, size, checked: true, error: None });
             }
         }
         self.total_found = items.iter().map(|x| x.size).sum();
@@ -263,15 +263,37 @@ impl FaxinaApp {
     fn clean_selected(&mut self) {
         let mut removed = 0u64;
         let exclusions = self.exclusions.clone();
+
         for item in self.scan_items.iter_mut().filter(|x| x.checked) {
+            item.error = None;
             let before = item.size;
-            clean_directory_contents(&item.path, &exclusions);
+            let failures = clean_directory_contents_report(&item.path, &exclusions);
             let after = dir_size(&item.path, &exclusions);
             removed = removed.saturating_add(before.saturating_sub(after));
             item.size = after;
+
+            if after > 0 {
+                item.error = Some(if failures.is_empty() {
+                    "Arquivos permaneceram ou foram recriados durante a limpeza.".into()
+                } else {
+                    summarize_failures(&failures)
+                });
+            }
         }
-        self.total_found = self.scan_items.iter().filter(|x| x.checked).map(|x| x.size).sum();
-        self.scan_status = format!("Limpeza concluída. Espaço efetivamente liberado: {}", fmt_bytes(removed));
+
+        self.scan_items
+            .retain(|item| !item.checked || item.size > 0 || item.error.is_some());
+        self.total_found = self.scan_items.iter().map(|x| x.size).sum();
+        let failed = self
+            .scan_items
+            .iter()
+            .filter(|x| x.checked && x.error.is_some())
+            .count();
+        self.scan_status = format!(
+            "Limpeza concluída • liberado {} • {} item(ns) permaneceram e continuam na lista",
+            fmt_bytes(removed),
+            failed
+        );
     }
 
     fn capture(&mut self, label: &str, program: &str, args: &[&str]) {
@@ -383,6 +405,12 @@ impl FaxinaApp {
                     ui.vertical(|ui| {
                         ui.strong(&item.name);
                         ui.small(item.path.display().to_string());
+                        if let Some(error) = &item.error {
+                            ui.small(
+                                egui::RichText::new(format!("Não removido: {error}"))
+                                    .color(themes()[self.theme_index].accent),
+                            );
+                        }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.strong(fmt_bytes(item.size));
@@ -412,8 +440,8 @@ impl FaxinaApp {
             if ui.button("Analisar resíduos").clicked() {
                 self.residues.analyze(&self.exclusions);
             }
-            if ui.button("Marcar somente seguros").clicked() {
-                self.residues.mark_safe();
+            if ui.button("Marcar todos").clicked() {
+                self.residues.mark_all();
             }
             if ui.button("Desmarcar tudo").clicked() {
                 self.residues.clear();
@@ -464,6 +492,12 @@ impl FaxinaApp {
                                 t.muted
                             }),
                         );
+                        if let Some(error) = &item.error {
+                            ui.small(
+                                egui::RichText::new(format!("Não removido: {error}"))
+                                    .color(t.accent),
+                            );
+                        }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.strong(fmt_bytes(item.size));
@@ -635,6 +669,9 @@ impl FaxinaApp {
             if ui.button("Recarregar").clicked() {
                 self.winapp2.reload(&config_dir());
             }
+            if ui.button("Verificar atualização").clicked() {
+                self.winapp2.check_update(&config_dir());
+            }
             if ui.button("Salvar marcações").clicked() {
                 self.winapp2.save_selection(&config_dir());
             }
@@ -648,12 +685,15 @@ impl FaxinaApp {
         ui.horizontal_wrapped(|ui| {
             if ui.button("Marcar todos exceto jogos, cache, telemetria e inseguros").clicked() {
                 self.winapp2.apply_safe_preset();
+                self.winapp2.save_selection(&config_dir());
             }
             if ui.button("Marcar tudo").clicked() {
                 self.winapp2.mark_all();
+                self.winapp2.save_selection(&config_dir());
             }
             if ui.button("Desmarcar tudo").clicked() {
                 self.winapp2.clear();
+                self.winapp2.save_selection(&config_dir());
             }
         });
 
@@ -697,8 +737,20 @@ impl FaxinaApp {
                     for group in &mut self.winapp2.analysis {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut group.checked, "");
-                            ui.strong(&group.rule_name);
-                            ui.label(format!("{} arquivos", group.file_count));
+                            ui.vertical(|ui| {
+                                ui.strong(&group.rule_name);
+                                ui.label(format!("{} arquivos", group.file_count));
+                                if !group.failures.is_empty() {
+                                    ui.small(
+                                        egui::RichText::new(format!(
+                                            "{} falha(s): {}",
+                                            group.failures.len(),
+                                            group.failures.first().cloned().unwrap_or_default()
+                                        ))
+                                        .color(t.accent),
+                                    );
+                                }
+                            });
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -762,6 +814,7 @@ impl FaxinaApp {
         });
         if changed {
             self.winapp2.refresh_status();
+            self.winapp2.save_selection(&config_dir());
         }
     }
 
@@ -844,6 +897,12 @@ impl FaxinaApp {
                     ui.vertical(|ui| {
                         ui.strong(format!("{} • {}", item.browser.label(), item.kind.label()));
                         ui.small(item.path.display().to_string());
+                        if let Some(error) = &item.error {
+                            ui.small(
+                                egui::RichText::new(format!("Não removido: {error}"))
+                                    .color(t.accent),
+                            );
+                        }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.strong(fmt_bytes(item.size));
@@ -1527,33 +1586,29 @@ impl FaxinaApp {
         ui.add_space(8.0);
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let paused = self
+            ui.horizontal(|ui| {
+                let paused_or_stopped = self
                     .about_audio
                     .as_ref()
-                    .map(|audio| audio.sink.is_paused())
+                    .map(|audio| audio.sink.is_paused() || audio.sink.empty())
                     .unwrap_or(true);
 
-                if ui.button(if paused { "Tocar" } else { "Pausar" }).clicked() {
+                if ui.button(if paused_or_stopped { "Tocar" } else { "Pausar" }).clicked() {
                     if let Some(audio) = &self.about_audio {
-                        if audio.sink.is_paused() {
+                        if audio.sink.empty() {
+                            self.restart_about_audio();
+                        } else if audio.sink.is_paused() {
                             audio.sink.play();
                         } else {
                             audio.sink.pause();
                         }
                     } else {
-                        let path = portable_root().join("assets").join("about-theme.mp4");
-                        match start_about_audio(&path, self.about_volume) {
-                            Ok(audio) => self.about_audio = Some(audio),
-                            Err(error) => self.last_output = error,
-                        }
+                        self.restart_about_audio();
                     }
                 }
 
                 if ui.button("Parar").clicked() {
-                    if let Some(audio) = self.about_audio.take() {
-                        audio.sink.stop();
-                    }
+                    self.stop_about_audio();
                 }
 
                 ui.label("Volume");
@@ -1569,27 +1624,42 @@ impl FaxinaApp {
                     if let Some(photo) = &self.about_creator {
                         ui.add(egui::Image::new((photo.id(), egui::vec2(78.0, 78.0))));
                     }
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("Criador: Juliano - Brasil - Sátia Mortadela")
-                                .strong(),
-                        );
-                        ui.label(
-                            egui::RichText::new("Rust Core • Windows x64 • Portátil")
-                                .color(t.muted),
-                        );
-                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(320.0, 78.0),
+                        egui::Layout::top_down(egui::Align::RIGHT),
+                        |ui| {
+                            ui.add_space(16.0);
+                            ui.label(
+                                egui::RichText::new("Criador: Juliano - Brasil - Sátia Mortadela")
+                                    .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new("Rust Core • Windows x64 • Portátil")
+                                    .color(t.muted),
+                            );
+                        },
+                    );
                 });
             });
         });
 
         ui.add_space(6.0);
         if let Some(background) = &self.about_background {
+            // O arquivo original contém um player de vídeo no topo direito.
+            // A seção mostra apenas a parte limpa da arte, cortando a faixa superior.
             let available = ui.available_width().max(120.0);
             let [w, h] = background.size();
-            let ratio = if w == 0 { 0.55 } else { h as f32 / w as f32 };
-            let height = (available * ratio).min(ui.available_height().max(220.0));
-            ui.add(egui::Image::new((background.id(), egui::vec2(available, height))));
+            let source_ratio = if w == 0 { 0.55 } else { h as f32 / w as f32 };
+            let visible_ratio = source_ratio * 0.81;
+            let height = (available * visible_ratio).min(ui.available_height().max(220.0));
+            let uv = egui::Rect::from_min_max(
+                egui::pos2(0.0, 0.19),
+                egui::pos2(1.0, 1.0),
+            );
+            ui.add(
+                egui::Image::new((background.id(), egui::vec2(available, height)))
+                    .uv(uv),
+            );
         } else {
             ui.centered_and_justified(|ui| {
                 ui.label(
@@ -1603,12 +1673,28 @@ impl FaxinaApp {
             ui.small(&self.last_output);
         }
     }
+
+    fn stop_about_audio(&mut self) {
+        if let Some(audio) = self.about_audio.take() {
+            audio.sink.stop();
+        }
+    }
+
+    fn restart_about_audio(&mut self) {
+        self.stop_about_audio();
+        let path = portable_root().join("assets").join("about-theme.mp4");
+        match start_about_audio(&path, self.about_volume) {
+            Ok(audio) => self.about_audio = Some(audio),
+            Err(error) => self.last_output = error,
+        }
+    }
 }
 
 impl eframe::App for FaxinaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
         let t = themes()[self.theme_index].clone();
+        let section_before_nav = self.section;
         egui::SidePanel::left("nav").exact_width(235.0).frame(egui::Frame::new().fill(t.panel).inner_margin(egui::Margin::same(12))).show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 Self::draw_trash(ui, 72.0, t.accent);
@@ -1628,6 +1714,15 @@ impl eframe::App for FaxinaApp {
                 ui.label(egui::RichText::new(format!("v{} • Motor pronto", env!("CARGO_PKG_VERSION"))).color(t.muted));
             });
         });
+
+        if self.section != section_before_nav {
+            if section_before_nav == Section::Sobre {
+                self.stop_about_audio();
+            }
+            if self.section == Section::Sobre {
+                self.restart_about_audio();
+            }
+        }
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(22))).show(ctx, |ui| {
             self.header(ui);
@@ -1673,7 +1768,7 @@ fn start_about_audio(path: &Path, volume: f32) -> Result<AboutAudio, String> {
     let source = rodio::Decoder::new(BufReader::new(file))
         .map_err(|error| format!("Falha ao decodificar áudio MP4: {error}"))?;
     sink.set_volume(volume.clamp(0.0, 1.0));
-    sink.append(source.repeat_infinite());
+    sink.append(source);
     Ok(AboutAudio {
         _stream: stream,
         sink,
@@ -1710,7 +1805,23 @@ fn run_picker_script(script: &str) -> Option<PathBuf> {
     if !output.status.success() {
         return None;
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    let hex = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let raw = hex.as_bytes();
+    for index in (0..raw.len()).step_by(2) {
+        let pair = std::str::from_utf8(&raw[index..index + 2]).ok()?;
+        bytes.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+    let value = String::from_utf8(bytes).ok()?;
     if value.is_empty() {
         None
     } else {
@@ -1726,7 +1837,7 @@ fn run_picker_script(_script: &str) -> Option<PathBuf> {
 fn pick_file_dialog(filter: &str) -> Option<PathBuf> {
     let filter = filter.replace('\'', "''");
     let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.OpenFileDialog; $d.Filter='{}'; if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){{[Console]::Write($d.FileName)}}",
+        "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.OpenFileDialog; $d.Filter='{}'; if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){{$b=[Text.Encoding]::UTF8.GetBytes($d.FileName); [Console]::Write(([BitConverter]::ToString($b)).Replace('-',''))}}",
         filter
     );
     run_picker_script(&script)
@@ -1736,14 +1847,14 @@ fn save_file_dialog(file_name: &str, filter: &str) -> Option<PathBuf> {
     let file_name = file_name.replace('\'', "''");
     let filter = filter.replace('\'', "''");
     let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.SaveFileDialog; $d.FileName='{}'; $d.Filter='{}'; if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){{[Console]::Write($d.FileName)}}",
+        "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.SaveFileDialog; $d.FileName='{}'; $d.Filter='{}'; if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){{$b=[Text.Encoding]::UTF8.GetBytes($d.FileName); [Console]::Write(([BitConverter]::ToString($b)).Replace('-',''))}}",
         file_name, filter
     );
     run_picker_script(&script)
 }
 
 fn pick_folder_dialog() -> Option<PathBuf> {
-    let script = "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.FolderBrowserDialog; if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Write($d.SelectedPath)}";
+    let script = "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.FolderBrowserDialog; if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){$b=[Text.Encoding]::UTF8.GetBytes($d.SelectedPath); [Console]::Write(([BitConverter]::ToString($b)).Replace('-',''))}";
     run_picker_script(script)
 }
 
@@ -1950,35 +2061,70 @@ fn dir_size(path: &Path, exclusions: &[String]) -> u64 {
     total
 }
 
-fn clean_directory_contents(path: &Path, exclusions: &[String]) {
-    if is_excluded(path, exclusions) {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let child = entry.path();
-        if is_excluded(&child, exclusions) {
-            continue;
+fn clean_directory_contents_report(path: &Path, exclusions: &[String]) -> Vec<String> {
+    fn visit(path: &Path, exclusions: &[String], failures: &mut Vec<String>) {
+        if is_excluded(path, exclusions) {
+            return;
         }
-        let Ok(meta) = fs::symlink_metadata(&child) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if meta.is_dir() {
-            clean_directory_contents(&child, exclusions);
-            let empty = fs::read_dir(&child)
-                .map(|mut it| it.next().is_none())
-                .unwrap_or(false);
-            if empty {
-                let _ = fs::remove_dir(&child);
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                failures.push(format!("{}: {}", path.display(), error));
+                return;
             }
-        } else {
-            let _ = fs::remove_file(&child);
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    failures.push(format!("Falha ao ler item: {error}"));
+                    continue;
+                }
+            };
+            let child = entry.path();
+            if is_excluded(&child, exclusions) {
+                continue;
+            }
+            let meta = match fs::symlink_metadata(&child) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    failures.push(format!("{}: {}", child.display(), error));
+                    continue;
+                }
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                visit(&child, exclusions, failures);
+                match fs::read_dir(&child) {
+                    Ok(mut left) if left.next().is_none() => {
+                        if let Err(error) = fs::remove_dir(&child) {
+                            failures.push(format!("{}: {}", child.display(), error));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => failures.push(format!("{}: {}", child.display(), error)),
+                }
+            } else if let Err(error) = fs::remove_file(&child) {
+                failures.push(format!("{}: {}", child.display(), error));
+            }
         }
+    }
+
+    let mut failures = Vec::new();
+    visit(path, exclusions, &mut failures);
+    failures
+}
+
+fn summarize_failures(failures: &[String]) -> String {
+    if failures.is_empty() {
+        return String::new();
+    }
+    if failures.len() == 1 {
+        failures[0].clone()
+    } else {
+        format!("{} falhas; primeira: {}", failures.len(), failures[0])
     }
 }
 

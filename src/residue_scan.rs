@@ -28,6 +28,7 @@ pub struct ResidueItem {
     pub reason: String,
     pub checked: bool,
     pub is_dir: bool,
+    pub error: Option<String>,
 }
 
 pub struct ResidueState {
@@ -88,6 +89,12 @@ impl ResidueState {
         }
     }
 
+    pub fn mark_all(&mut self) {
+        for item in &mut self.items {
+            item.checked = true;
+        }
+    }
+
     pub fn clear(&mut self) {
         for item in &mut self.items {
             item.checked = false;
@@ -104,27 +111,53 @@ impl ResidueState {
 
     pub fn delete_selected(&mut self, exclusions: &[String]) -> u64 {
         let mut removed = 0u64;
-        for item in &self.items {
-            if !item.checked || is_excluded(&item.path, exclusions) {
+        for item in self.items.iter_mut().filter(|item| item.checked) {
+            item.error = None;
+            if is_excluded(&item.path, exclusions) {
+                item.error = Some("Protegido pelas Exclusões globais.".into());
                 continue;
             }
+
             if item.is_dir {
                 let before = dir_size(&item.path, exclusions);
-                clean_directory_contents(&item.path, exclusions);
+                let failures = clean_directory_contents_report(&item.path, exclusions);
                 let after = dir_size(&item.path, exclusions);
                 removed = removed.saturating_add(before.saturating_sub(after));
+                item.size = after;
                 if after == 0 {
-                    let _ = fs::remove_dir(&item.path);
+                    if let Err(error) = fs::remove_dir(&item.path) {
+                        if item.path.exists() {
+                            item.error = Some(format!("Não foi possível remover a pasta: {error}"));
+                        }
+                    }
+                } else {
+                    item.error = Some(if failures.is_empty() {
+                        "Parte do conteúdo permaneceu em uso ou foi recriada.".into()
+                    } else if failures.len() == 1 {
+                        failures[0].clone()
+                    } else {
+                        format!("{} falhas; primeira: {}", failures.len(), failures[0])
+                    });
                 }
-            } else if fs::remove_file(&item.path).is_ok() {
-                removed = removed.saturating_add(item.size);
+            } else {
+                match fs::remove_file(&item.path) {
+                    Ok(_) => removed = removed.saturating_add(item.size),
+                    Err(error) => item.error = Some(error.to_string()),
+                }
             }
         }
-        self.items.retain(|item| item.path.exists());
+
+        self.items
+            .retain(|item| !item.checked || item.path.exists() || item.error.is_some());
+        let failed = self
+            .items
+            .iter()
+            .filter(|item| item.checked && item.error.is_some())
+            .count();
         self.status = format!(
-            "Limpeza de resíduos concluída • liberado {} • {} itens restantes na lista",
+            "Limpeza de resíduos concluída • liberado {} • {} item(ns) não puderam ser removidos",
             fmt_bytes(removed),
-            self.items.len()
+            failed
         );
         removed
     }
@@ -175,6 +208,7 @@ fn scan_dir(
                         reason: "Cache regenerável de Python/ferramenta de desenvolvimento".into(),
                         checked: false,
                         is_dir: true,
+                        error: None,
                     });
                 }
                 continue;
@@ -214,6 +248,7 @@ fn scan_dir(
                 reason,
                 checked: false,
                 is_dir: false,
+                error: None,
             });
         }
     }
@@ -277,36 +312,60 @@ fn dir_size(path: &Path, exclusions: &[String]) -> u64 {
     total
 }
 
-fn clean_directory_contents(path: &Path, exclusions: &[String]) {
-    if is_excluded(path, exclusions) {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let child = entry.path();
-        if is_excluded(&child, exclusions) {
-            continue;
+fn clean_directory_contents_report(path: &Path, exclusions: &[String]) -> Vec<String> {
+    fn visit(path: &Path, exclusions: &[String], failures: &mut Vec<String>) {
+        if is_excluded(path, exclusions) {
+            return;
         }
-        let Ok(meta) = fs::symlink_metadata(&child) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if meta.is_dir() {
-            clean_directory_contents(&child, exclusions);
-            let empty = fs::read_dir(&child)
-                .map(|mut it| it.next().is_none())
-                .unwrap_or(false);
-            if empty {
-                let _ = fs::remove_dir(&child);
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                failures.push(format!("{}: {}", path.display(), error));
+                return;
             }
-        } else {
-            let _ = fs::remove_file(&child);
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    failures.push(format!("Falha ao ler item: {error}"));
+                    continue;
+                }
+            };
+            let child = entry.path();
+            if is_excluded(&child, exclusions) {
+                continue;
+            }
+            let meta = match fs::symlink_metadata(&child) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    failures.push(format!("{}: {}", child.display(), error));
+                    continue;
+                }
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                visit(&child, exclusions, failures);
+                match fs::read_dir(&child) {
+                    Ok(mut left) if left.next().is_none() => {
+                        if let Err(error) = fs::remove_dir(&child) {
+                            failures.push(format!("{}: {}", child.display(), error));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => failures.push(format!("{}: {}", child.display(), error)),
+                }
+            } else if let Err(error) = fs::remove_file(&child) {
+                failures.push(format!("{}: {}", child.display(), error));
+            }
         }
     }
+
+    let mut failures = Vec::new();
+    visit(path, exclusions, &mut failures);
+    failures
 }
 
 fn should_skip_directory(path: &Path) -> bool {
