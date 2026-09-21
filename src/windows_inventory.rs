@@ -1,11 +1,12 @@
 use serde::Deserialize;
 use std::{
     collections::HashSet,
+    io::Read,
     path::Path,
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(windows)]
@@ -708,45 +709,67 @@ foreach ($root in $shellRoots) {
     }
 }
 
-# ActiveX/COM: somente servidor local absoluto, fora do Windows, inexistente, sem TreatAs/LocalService
+# ActiveX/COM: enumeração direta pelo .NET Registry (muito mais rápida que o provider do PowerShell)
 $clsidRoots = @(
-  @{ PS='HKCU:\Software\Classes\CLSID'; Reg='HKCU\Software\Classes\CLSID' },
-  @{ PS='HKLM:\Software\Classes\CLSID'; Reg='HKLM\Software\Classes\CLSID' },
-  @{ PS='HKLM:\Software\Classes\WOW6432Node\CLSID'; Reg='HKLM\Software\Classes\WOW6432Node\CLSID' }
+  @{ Root=[Microsoft.Win32.Registry]::CurrentUser; Path='Software\Classes\CLSID'; Reg='HKCU\Software\Classes\CLSID' },
+  @{ Root=[Microsoft.Win32.Registry]::LocalMachine; Path='Software\Classes\CLSID'; Reg='HKLM\Software\Classes\CLSID' },
+  @{ Root=[Microsoft.Win32.Registry]::LocalMachine; Path='Software\Classes\WOW6432Node\CLSID'; Reg='HKLM\Software\Classes\WOW6432Node\CLSID' }
 )
 foreach ($root in $clsidRoots) {
-    if (-not (Test-Path -LiteralPath $root.PS)) { continue }
-    foreach ($clsid in Get-ChildItem -LiteralPath $root.PS -ErrorAction SilentlyContinue) {
-        foreach ($serverName in @('InprocServer32','LocalServer32')) {
-            $serverKey = Get-Item -LiteralPath ($clsid.PSPath + '\' + $serverName) -ErrorAction SilentlyContinue
-            if (-not $serverKey) { continue }
-            $raw = Expand-Text ([string]$serverKey.GetValue(''))
-            if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+    $base = $null
+    try { $base = $root.Root.OpenSubKey($root.Path) } catch {}
+    if (-not $base) { continue }
 
-            if ($serverName -eq 'LocalServer32') {
-                $target = Get-ExecutableTarget $raw
-            } else {
-                $candidate = $raw.Trim('"')
-                $target = if ([IO.Path]::IsPathRooted($candidate)) { $candidate } else { $null }
-            }
+    try {
+        foreach ($clsidName in $base.GetSubKeyNames()) {
+            $clsidKey = $null
+            try { $clsidKey = $base.OpenSubKey($clsidName) } catch {}
+            if (-not $clsidKey) { continue }
 
-            if ($target -and (Is-LocalMissingPath $target) -and -not (Is-WindowsPath $target)) {
-                $parentObj = Get-Item -LiteralPath $clsid.PSPath -ErrorAction SilentlyContinue
-                $localService = if ($parentObj) { [string]$parentObj.GetValue('LocalService') } else { '' }
-                $treatAs = Get-Item -LiteralPath ($clsid.PSPath + '\TreatAs') -ErrorAction SilentlyContinue
-                if ([string]::IsNullOrWhiteSpace($localService) -and -not $treatAs) {
-                    Add-SafeItem 'ActiveX/COM' 'Key' ($root.Reg + '\' + $clsid.PSChildName) '' $target ('Registro COM órfão: ' + $serverName) 'O servidor COM é caminho local absoluto, não é do Windows e o arquivo não existe.'
-                    break
+            try {
+                $localService = [string]$clsidKey.GetValue('LocalService', '')
+                if (-not [string]::IsNullOrWhiteSpace($localService)) { continue }
+                $treatAs = $null
+                try { $treatAs = $clsidKey.OpenSubKey('TreatAs') } catch {}
+                if ($treatAs) { $treatAs.Dispose(); continue }
+
+                foreach ($serverName in @('InprocServer32','LocalServer32')) {
+                    $serverKey = $null
+                    try { $serverKey = $clsidKey.OpenSubKey($serverName) } catch {}
+                    if (-not $serverKey) { continue }
+
+                    try {
+                        $raw = Expand-Text ([string]$serverKey.GetValue('', ''))
+                        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+
+                        if ($serverName -eq 'LocalServer32') {
+                            $target = Get-ExecutableTarget $raw
+                        } else {
+                            $candidate = $raw.Trim('"')
+                            $target = if ([IO.Path]::IsPathRooted($candidate)) { $candidate } else { $null }
+                        }
+
+                        if ($target -and (Is-LocalMissingPath $target) -and -not (Is-WindowsPath $target)) {
+                            Add-SafeItem 'ActiveX/COM' 'Key' ($root.Reg + '\' + $clsidName) '' $target ('Registro COM órfão: ' + $serverName) 'O servidor COM é caminho local absoluto, não é do Windows e o arquivo não existe.'
+                            break
+                        }
+                    } finally {
+                        $serverKey.Dispose()
+                    }
                 }
+            } finally {
+                $clsidKey.Dispose()
             }
         }
+    } finally {
+        $base.Dispose()
     }
 }
 
 [Console]::Write((ConvertTo-Json -InputObject @($items) -Compress -Depth 6))
 "#;
 
-        run_json::<RegistryOrphan>(SCRIPT)
+        run_json_timeout::<RegistryOrphan>(SCRIPT, Duration::from_secs(30))
     }
 
     pub fn registry_cleanup_command(&self, backup_dir: &Path) -> Option<(String, String)> {
@@ -833,6 +856,81 @@ where
     }
     serde_json::from_str(&stdout)
         .map_err(|error| format!("Falha ao interpretar inventário do Windows: {error}\n{stdout}"))
+}
+
+fn run_json_timeout<T>(script: &str, timeout: Duration) -> Result<Vec<T>, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Falha ao iniciar varredura do Registro: {error}"))?;
+    let started = Instant::now();
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    return Err(format!(
+                        "A Varredura Segura foi interrompida após {} s para evitar um scanner preso.{}",
+                        timeout.as_secs(),
+                        if stderr.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(" Detalhe: {}", stderr.trim())
+                        }
+                    ));
+                }
+                thread::sleep(Duration::from_millis(80));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Falha ao acompanhar a varredura do Registro: {error}"));
+            }
+        }
+    };
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+
+    let stdout = stdout.trim_start_matches('\u{feff}').trim().to_string();
+    let stderr = stderr.trim().to_string();
+
+    if !status.success() {
+        return Err(format!(
+            "PowerShell terminou com erro: {}",
+            if stderr.is_empty() { stdout } else { stderr }
+        ));
+    }
+    if stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    serde_json::from_str(&stdout)
+        .map_err(|error| format!("Falha ao interpretar Varredura Segura: {error}\n{stdout}"))
 }
 
 fn ps_quote(value: &str) -> String {

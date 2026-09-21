@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +90,18 @@ impl BrowserState {
     }
 
     pub fn analyze(&mut self, exclusions: &[String]) {
+        let started = Instant::now();
+        crate::diagnostics::operation_start(
+            "navegadores_portateis",
+            "analyze",
+            serde_json::json!({
+                "configured": {
+                    "chrome": !self.chrome.trim().is_empty(),
+                    "edge": !self.edge.trim().is_empty(),
+                    "firefox": !self.firefox.trim().is_empty()
+                }
+            }),
+        );
         self.items.clear();
         let configs = [
             (BrowserKind::Chrome, self.chrome.clone()),
@@ -157,17 +170,65 @@ impl BrowserState {
                 invalid.join(", ")
             )
         };
+
+        for item in &self.items {
+            crate::diagnostics::event(
+                "browser_analysis_item",
+                "Área de navegador portátil detectada",
+                serde_json::json!({
+                    "browser": item.browser.label(),
+                    "kind": item.kind.label(),
+                    "path": item.path.to_string_lossy(),
+                    "bytes": item.size
+                }),
+            );
+        }
+        crate::diagnostics::operation_end(
+            "navegadores_portateis",
+            "analyze",
+            true,
+            started.elapsed().as_millis(),
+            serde_json::json!({
+                "items": self.items.len(),
+                "bytes": total,
+                "invalid_paths": invalid
+            }),
+        );
     }
 
     pub fn clean_selected(&mut self, exclusions: &[String]) -> u64 {
+        let started = Instant::now();
+        let selected = self.items.iter().filter(|item| item.checked).count();
+        crate::diagnostics::operation_start(
+            "navegadores_portateis",
+            "clean_selected",
+            serde_json::json!({"selected": selected}),
+        );
+
         let mut removed = 0u64;
         for item in self.items.iter_mut().filter(|item| item.checked) {
             item.error = None;
-            let before = item.size;
+            let before = dir_size(&item.path, exclusions);
             let failures = clean_directory_contents_report(&item.path, exclusions);
             let after = dir_size(&item.path, exclusions);
-            removed = removed.saturating_add(before.saturating_sub(after));
+            let freed = before.saturating_sub(after);
+            removed = removed.saturating_add(freed);
             item.size = after;
+
+            crate::diagnostics::event(
+                "browser_cleanup_item",
+                "Área de navegador portátil processada",
+                serde_json::json!({
+                    "browser": item.browser.label(),
+                    "kind": item.kind.label(),
+                    "path": item.path.to_string_lossy(),
+                    "before_bytes": before,
+                    "after_bytes": after,
+                    "freed_bytes": freed,
+                    "failures": failures.len()
+                }),
+            );
+
             if after > 0 {
                 item.error = Some(if failures.is_empty() {
                     "Arquivos permaneceram ou foram recriados pelo navegador.".into()
@@ -190,6 +251,16 @@ impl BrowserState {
             "Limpeza dos navegadores concluída • liberado {} • {} área(s) permaneceram",
             fmt_bytes(removed),
             failed
+        );
+        crate::diagnostics::operation_end(
+            "navegadores_portateis",
+            "clean_selected",
+            true,
+            started.elapsed().as_millis(),
+            serde_json::json!({
+                "freed_bytes": removed,
+                "remaining_areas": failed
+            }),
         );
         removed
     }

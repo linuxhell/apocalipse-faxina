@@ -7,6 +7,7 @@ mod drivers;
 mod duplicates;
 mod optimizer_db;
 mod portable_browsers;
+mod portable_mail;
 mod residue_scan;
 mod services;
 mod startup;
@@ -62,6 +63,7 @@ enum Section {
     Duplicados,
     Winapp2,
     Navegadores,
+    EmailPortateis,
     Desenvolvimento,
     WinSxS,
     Discos,
@@ -88,6 +90,7 @@ impl Section {
             (Section::Duplicados, "≡", "Arquivos duplicados"),
             (Section::Winapp2, "W", "Winapp2.ini"),
             (Section::Navegadores, "B", "Navegadores portáteis"),
+            (Section::EmailPortateis, "E", "Clientes de e-mail portáteis"),
             (Section::Desenvolvimento, "P", "Python / Desenvolvimento"),
             (Section::WinSxS, "▦", "WinSxS"),
             (Section::Discos, "◉", "Discos / SSD"),
@@ -168,6 +171,7 @@ struct FaxinaApp {
     exclusion_input: String,
     winapp2: winapp2::Winapp2State,
     browsers: portable_browsers::BrowserState,
+    mail: portable_mail::MailState,
     residues: residue_scan::ResidueState,
     duplicates: duplicates::DuplicateState,
     duplicate_thumbnails: HashMap<String, egui::TextureHandle>,
@@ -199,6 +203,7 @@ impl FaxinaApp {
         let exclusions = load_exclusions();
         let winapp2 = winapp2::Winapp2State::load(&root, &cfg);
         let browsers = portable_browsers::BrowserState::load(&cfg);
+        let mail = portable_mail::MailState::load(&cfg);
         let mut defrag = defrag::DefragState::default();
         defrag.start_detect();
         let about_background = load_texture(&cc.egui_ctx, &root.join("assets").join("about-background.jpg"), "about-background");
@@ -215,6 +220,7 @@ impl FaxinaApp {
             exclusion_input: String::new(),
             winapp2,
             browsers,
+            mail,
             residues: residue_scan::ResidueState::default(),
             duplicates: duplicates::DuplicateState::default(),
             duplicate_thumbnails: HashMap::new(),
@@ -941,6 +947,108 @@ impl FaxinaApp {
                 ui.separator();
             }
         });
+    }
+
+    fn page_mail_clients(&mut self, ui: &mut egui::Ui) {
+        self.mail.poll();
+        if self.mail.busy() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
+        let t = themes()[self.theme_index].clone();
+        ui.label("Cliente de e-mail portátil");
+        ui.small("Nesta seção há um único cliente: Thunderbird Portable. O Faxina localiza somente cache e telemetria dentro do perfil portátil; mensagens, contas, senhas, catálogos, extensões e arquivos de e-mail não entram na limpeza.");
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label("Thunderbird Portable:");
+            ui.text_edit_singleline(&mut self.mail.thunderbird);
+            if ui.button("Escolher .exe").clicked() {
+                if let Some(path) = pick_file_dialog("Executáveis (*.exe)|*.exe|Todos os arquivos (*.*)|*.*") {
+                    self.mail.thunderbird = path.to_string_lossy().to_string();
+                    match self.mail.save(&config_dir()) {
+                        Ok(()) => self.mail.status = "Caminho do Thunderbird Portable salvo.".into(),
+                        Err(error) => self.mail.status = error,
+                    }
+                }
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Salvar caminho").clicked() {
+                match self.mail.save(&config_dir()) {
+                    Ok(()) => self.mail.status = "Caminho salvo.".into(),
+                    Err(error) => self.mail.status = error,
+                }
+            }
+
+            if ui
+                .add_enabled(!self.mail.busy(), egui::Button::new("Analisar cache e telemetria"))
+                .clicked()
+            {
+                let _ = self.mail.save(&config_dir());
+                self.mail.start_analyze(&self.exclusions);
+            }
+
+            if ui
+                .add_enabled(
+                    !self.mail.busy() && self.mail.items.iter().any(|item| item.checked),
+                    egui::Button::new("Limpar selecionados"),
+                )
+                .clicked()
+            {
+                self.mail.start_clean(&self.exclusions);
+            }
+        });
+
+        if self.mail.busy() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(if self.mail.analyzing {
+                    "Analisando Thunderbird Portable…"
+                } else {
+                    "Limpando Thunderbird Portable…"
+                });
+            });
+        }
+
+        ui.label(&self.mail.status);
+        if !self.mail.items.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Total detectado: {}",
+                    fmt_bytes(self.mail.total_size())
+                ))
+                .size(18.0)
+                .strong()
+                .color(t.accent),
+            );
+        }
+
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("portable_mail_items")
+            .show(ui, |ui| {
+                for item in &mut self.mail.items {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut item.checked, "");
+                        ui.vertical(|ui| {
+                            ui.strong(format!("Thunderbird Portable • {}", item.kind.label()));
+                            ui.small(item.path.display().to_string());
+                            if let Some(error) = &item.error {
+                                ui.small(
+                                    egui::RichText::new(format!("Não removido: {error}"))
+                                        .color(t.accent),
+                                );
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.strong(fmt_bytes(item.size));
+                        });
+                    });
+                    ui.separator();
+                }
+            });
     }
 
     fn page_disks(&mut self, ui: &mut egui::Ui) {
@@ -2318,6 +2426,28 @@ impl FaxinaApp {
         if !self.last_output.is_empty() && self.last_output.to_ascii_lowercase().contains("áudio") {
             ui.small(egui::RichText::new(&self.last_output).color(t.accent));
         }
+
+        ui.add_space(10.0);
+        ui.separator();
+        let paypal_url = "https://www.paypal.com/donate/?business=jv12802%40gmail.com&item_name=Apocalipse%20Faxina&currency_code=BRL";
+        let donation = ui.hyperlink_to(
+            egui::RichText::new("Faça uma doação via PayPal")
+                .strong()
+                .color(t.accent),
+            paypal_url,
+        );
+        if donation.clicked() {
+            diagnostics::event(
+                "paypal_donation",
+                "Link de doação PayPal aberto",
+                serde_json::json!({
+                    "recipient": "jv12802@gmail.com",
+                    "currency": "BRL",
+                    "amount": "definido pelo doador na página do PayPal"
+                }),
+            );
+        }
+        ui.small("O PayPal abrirá no navegador padrão para você escolher o valor da doação destinada a jv12802@gmail.com.");
     }
 
     fn stop_about_audio(&mut self) {
@@ -2442,6 +2572,7 @@ impl eframe::App for FaxinaApp {
                 Section::Duplicados => self.page_duplicates(ui, ctx),
                 Section::Winapp2 => self.page_winapp2(ui),
                 Section::Navegadores => self.page_browsers(ui),
+                Section::EmailPortateis => self.page_mail_clients(ui),
                 Section::Desenvolvimento => self.page_development(ui),
                 Section::WinSxS => self.page_winsxs(ui),
                 Section::Discos => self.page_disks(ui),
