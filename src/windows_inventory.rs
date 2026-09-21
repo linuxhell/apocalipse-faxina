@@ -748,3 +748,93 @@ foreach ($root in $clsidRoots) {
 
         run_json::<RegistryOrphan>(SCRIPT)
     }
+
+    pub fn registry_cleanup_command(&self, backup_dir: &Path) -> Option<(String, String)> {
+        let selected: Vec<&RegistryOrphan> =
+            self.registry_orphans.iter().filter(|x| x.checked).collect();
+        if selected.is_empty() {
+            return None;
+        }
+
+        let mut unique_keys = HashSet::new();
+        let mut exports = Vec::new();
+        let mut deletes = Vec::new();
+        let mut manifest = String::from("BACKUP DE REGISTRO — APOCALIPSE FAXINA\nMODO: VARREDURA SEGURA\n\n");
+
+        for (index, item) in selected.iter().enumerate() {
+            manifest.push_str(&format!(
+                "{}\nCategoria: {}\nTipo: {}\nChave: {}\nValor: {}\nAlvo: {}\nMotivo: {}\nEvidência: {}\n\n",
+                index + 1,
+                item.category,
+                item.kind,
+                item.reg_path,
+                if item.value_name.is_empty() { "(Padrão)" } else { &item.value_name },
+                item.target,
+                item.reason,
+                item.evidence
+            ));
+
+            if unique_keys.insert(item.reg_path.clone()) {
+                let file = backup_dir.join(format!("chave-{:03}.reg", exports.len() + 1));
+                exports.push(format!(
+                    r#"reg export "{}" "{}" /y"#,
+                    item.reg_path,
+                    file.display()
+                ));
+            }
+
+            if item.kind == "Key" {
+                deletes.push(format!(r#"reg delete "{}" /f"#, item.reg_path));
+            } else if item.value_name.is_empty() {
+                deletes.push(format!(r#"reg delete "{}" /ve /f"#, item.reg_path));
+            } else {
+                deletes.push(format!(
+                    r#"reg delete "{}" /v "{}" /f"#,
+                    item.reg_path, item.value_name
+                ));
+            }
+        }
+
+        let command = format!("{} && {}", exports.join(" && "), deletes.join(" & "));
+        Some((command, manifest))
+    }
+}
+
+fn run_json<T>(script: &str) -> Result<Vec<T>, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-Command", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let output = command
+        .output()
+        .map_err(|error| format!("Falha ao executar PowerShell: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout)
+        .trim_start_matches('\u{feff}')
+        .trim()
+        .to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !output.status.success() {
+        return Err(format!(
+            "PowerShell terminou com erro: {}",
+            if stderr.is_empty() { stdout } else { stderr }
+        ));
+    }
+    if stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&stdout)
+        .map_err(|error| format!("Falha ao interpretar inventário do Windows: {error}\n{stdout}"))
+}
+
+fn ps_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
