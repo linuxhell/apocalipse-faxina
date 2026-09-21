@@ -1346,13 +1346,31 @@ impl FaxinaApp {
     }
 
     fn page_registry(&mut self, ui: &mut egui::Ui) {
+        self.inventory.poll_registry_scan();
+        if self.inventory.registry_scanning {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
         let t = themes()[self.theme_index].clone();
-        ui.label("Scanner conservador: somente referências com alvo inexistente em Run/RunOnce e App Paths. Nenhuma limpeza genérica de 'milhares de erros'.");
+        ui.label("Varredura Segura do Registro: inspirada no conceito Safe Scan do Wise, com regras conservadoras próprias do Faxina.");
+        ui.small("O modo Safe só retorna referências com evidência objetiva de órfão. Histórico/MRU, IFEO, serviços, chaves vazias genéricas e outras áreas ambíguas ficam fora desta varredura.");
+
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Analisar órfãos confirmados").clicked() {
+            if ui
+                .add_enabled(
+                    !self.inventory.registry_scanning,
+                    egui::Button::new(if self.inventory.registry_scanning {
+                        "Analisando Registro…"
+                    } else {
+                        "Varredura segura"
+                    }),
+                )
+                .clicked()
+            {
                 self.inventory.scan_registry_orphans();
             }
-            if ui.button("Marcar todos encontrados").clicked() {
+
+            if ui.button("Marcar seguros").clicked() {
                 for item in &mut self.inventory.registry_orphans {
                     item.checked = true;
                 }
@@ -1370,10 +1388,18 @@ impl FaxinaApp {
             }
         });
 
+        if self.inventory.registry_scanning {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Verificando locais seguros em segundo plano…");
+            });
+        }
+
         if ui
             .add_enabled(
-                self.inventory.registry_orphans.iter().any(|x| x.checked),
-                egui::Button::new("Backup + remover selecionados"),
+                !self.inventory.registry_scanning
+                    && self.inventory.registry_orphans.iter().any(|x| x.checked),
+                egui::Button::new("Backup + remover seguros selecionados"),
             )
             .clicked()
         {
@@ -1387,7 +1413,15 @@ impl FaxinaApp {
                         self.inventory.registry_cleanup_command(&backup)
                     {
                         let _ = fs::write(backup.join("manifesto.txt"), manifest);
-                        self.elevated_cmd("Limpeza conservadora do Registro", &command);
+                        diagnostics::event(
+                            "registry_cleanup",
+                            "Limpeza segura do Registro iniciada",
+                            serde_json::json!({
+                                "selected": self.inventory.registry_orphans.iter().filter(|x| x.checked).count(),
+                                "backup": backup.to_string_lossy()
+                            }),
+                        );
+                        self.elevated_cmd("Limpeza segura do Registro", &command);
                         self.last_output.push_str(&format!(
                             "\n\nBackup .reg e manifesto salvos em:\n{}",
                             backup.display()
@@ -1402,28 +1436,55 @@ impl FaxinaApp {
         }
 
         ui.label(&self.inventory.registry_status);
-        ui.small("Cada chave selecionada é exportada para .reg antes de qualquer remoção. Services, COM e HKLM\\SYSTEM não entram neste scanner.");
+        ui.small("Todos os resultados do Safe vêm marcados. Cada chave/valor é exportado para .reg antes da remoção; o scanner nunca apaga os arquivos apontados.");
         ui.separator();
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for item in &mut self.inventory.registry_orphans {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut item.checked, "");
-                    ui.vertical(|ui| {
-                        ui.strong(&item.reason);
-                        ui.small(&item.reg_path);
-                        if !item.value_name.is_empty() {
-                            ui.small(format!("Valor: {}", item.value_name));
+        egui::ScrollArea::vertical()
+            .id_salt("registry_safe_results")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut last_category = String::new();
+
+                for item in &mut self.inventory.registry_orphans {
+                    if item.category != last_category {
+                        if !last_category.is_empty() {
+                            ui.add_space(6.0);
                         }
-                        ui.small(
-                            egui::RichText::new(format!("Alvo inexistente: {}", item.target))
-                                .color(t.muted),
+                        last_category = item.category.clone();
+                        ui.label(
+                            egui::RichText::new(&item.category)
+                                .strong()
+                                .size(15.0)
+                                .color(t.accent),
                         );
+                        ui.separator();
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut item.checked, "");
+                        ui.vertical(|ui| {
+                            ui.strong(&item.reason);
+                            ui.small(&item.reg_path);
+                            if !item.value_name.is_empty() {
+                                ui.small(format!("Valor: {}", item.value_name));
+                            }
+                            if !item.target.is_empty() {
+                                ui.small(
+                                    egui::RichText::new(format!("Alvo inexistente: {}", item.target))
+                                        .color(t.muted),
+                                );
+                            }
+                            if !item.evidence.is_empty() {
+                                ui.small(
+                                    egui::RichText::new(format!("Evidência: {}", item.evidence))
+                                        .color(t.muted),
+                                );
+                            }
+                        });
                     });
-                });
-                ui.separator();
-            }
-        });
+                    ui.separator();
+                }
+            });
     }
 
     fn page_startup(&mut self, ui: &mut egui::Ui) {
