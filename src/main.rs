@@ -19,6 +19,7 @@ use std::{
     collections::HashMap,
     env,
     fs,
+    io::BufReader,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -31,7 +32,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW,
+    FindWindowW, GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW,
     GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
 };
 
@@ -2251,7 +2252,7 @@ impl FaxinaApp {
         }
 
         if !self.last_output.is_empty() && self.last_output.to_ascii_lowercase().contains("áudio") {
-            ui.small(&self.last_output);
+            ui.small(egui::RichText::new(&self.last_output).color(t.accent));
         }
     }
 
@@ -2263,33 +2264,53 @@ impl FaxinaApp {
 
     fn restart_about_audio(&mut self) {
         self.stop_about_audio();
-        let assets = portable_root().join("assets");
-        let mp3 = assets.join("about-theme.mp3");
-        let path = if mp3.is_file() {
-            mp3
-        } else {
-            assets.join("about-theme.mp4")
-        };
+        let path = portable_root().join("assets").join("about-theme.mp3");
+
         diagnostics::event(
             "about_audio",
-            "Iniciando áudio da seção Sobre pelo mecanismo multimídia do Windows",
-            serde_json::json!({"path": path.to_string_lossy()}),
+            "Iniciando áudio da seção Sobre pelo backend Rust/WASAPI",
+            serde_json::json!({
+                "path": path.to_string_lossy(),
+                "exists": path.is_file(),
+                "backend": "rodio/cpal/WASAPI"
+            }),
         );
 
         match start_about_audio(&path, self.about_volume) {
             Ok(audio) => {
                 self.about_audio = Some(audio);
                 self.last_output.clear();
-                diagnostics::event("about_audio", "Processo de áudio iniciado", serde_json::json!({}));
+                diagnostics::event(
+                    "about_audio",
+                    "Áudio iniciado com backend portátil",
+                    serde_json::json!({"backend": "rodio/cpal/WASAPI"}),
+                );
             }
             Err(error) => {
                 self.last_output = error.clone();
                 diagnostics::event(
                     "about_audio_error",
-                    "Falha ao iniciar áudio",
+                    "Falha ao iniciar áudio portátil",
                     serde_json::json!({"error": error}),
                 );
             }
+        }
+    }
+
+    fn poll_about_audio(&mut self) {
+        let finished = self
+            .about_audio
+            .as_ref()
+            .map(|audio| audio.finished())
+            .unwrap_or(false);
+
+        if finished {
+            self.about_audio.take();
+            diagnostics::event(
+                "about_audio",
+                "Reprodução concluída",
+                serde_json::json!({"backend": "rodio/cpal/WASAPI"}),
+            );
         }
     }
 
@@ -2408,158 +2429,77 @@ impl eframe::App for FaxinaApp {
 
 
 struct AboutAudio {
-    child: std::process::Child,
-    control_path: PathBuf,
-    status_path: PathBuf,
+    _stream: rodio::OutputStream,
+    sink: rodio::Sink,
     paused: bool,
 }
 
 impl AboutAudio {
-    fn write_command(&self, command: &str) -> Result<(), String> {
-        fs::write(&self.control_path, command.as_bytes())
-            .map_err(|error| format!("Falha ao controlar áudio: {error}"))
-    }
-
     fn pause(&mut self) -> Result<(), String> {
-        self.write_command("pause")?;
+        self.sink.pause();
         self.paused = true;
+        diagnostics::event(
+            "about_audio_control",
+            "Áudio pausado",
+            serde_json::json!({"backend": "rodio/cpal/WASAPI"}),
+        );
         Ok(())
     }
 
     fn play(&mut self) -> Result<(), String> {
-        self.write_command("play")?;
+        self.sink.play();
         self.paused = false;
+        diagnostics::event(
+            "about_audio_control",
+            "Áudio retomado",
+            serde_json::json!({"backend": "rodio/cpal/WASAPI"}),
+        );
         Ok(())
     }
 
     fn set_volume(&self, volume: f32) -> Result<(), String> {
-        self.write_command(&format!("volume={:.4}", volume.clamp(0.0, 1.0)))
+        self.sink.set_volume(volume.clamp(0.0, 1.0));
+        Ok(())
     }
 
-    fn poll_finished(&mut self) -> Option<(bool, String)> {
-        match self.child.try_wait() {
-            Ok(Some(status)) => {
-                let detail = fs::read_to_string(&self.status_path)
-                    .unwrap_or_else(|_| format!("Processo finalizado com {status}"));
-                Some((status.success(), detail.trim().to_string()))
-            }
-            Ok(None) => None,
-            Err(error) => Some((false, format!("Falha ao consultar player: {error}"))),
-        }
+    fn finished(&self) -> bool {
+        self.sink.empty()
     }
 }
 
 impl Drop for AboutAudio {
     fn drop(&mut self) {
-        let _ = fs::write(&self.control_path, b"stop");
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = fs::remove_file(&self.control_path);
+        self.sink.stop();
     }
 }
 
 fn start_about_audio(path: &Path, volume: f32) -> Result<AboutAudio, String> {
     if !path.is_file() {
-        return Err(format!("Arquivo de áudio não encontrado: {}", path.display()));
+        return Err(format!(
+            "Áudio portátil não encontrado: {}. Extraia o ZIP completo do Faxina para uma pasta nova; não substitua apenas o EXE.",
+            path.display()
+        ));
     }
 
-    let control_dir = portable_root().join("logs").join("about-audio");
-    fs::create_dir_all(&control_dir)
-        .map_err(|error| format!("Falha ao preparar controle de áudio: {error}"))?;
-    let control_path = control_dir.join("control.txt");
-    let status_path = diagnostics::session_dir()
-        .unwrap_or_else(|| control_dir.clone())
-        .join("about-audio-status.txt");
-    let _ = fs::remove_file(&control_path);
-    let _ = fs::remove_file(&status_path);
-    fs::write(&control_path, b"play")
-        .map_err(|error| format!("Falha ao criar controle de áudio: {error}"))?;
+    let file = fs::File::open(path)
+        .map_err(|error| format!("Falha ao abrir {}: {error}", path.display()))?;
+    let source = rodio::Decoder::new(BufReader::new(file))
+        .map_err(|error| format!("Falha ao decodificar MP3 embutido: {error}"))?;
 
-    let media = path.to_string_lossy().replace('\'', "''");
-    let control = control_path.to_string_lossy().replace('\'', "''");
-    let status = status_path.to_string_lossy().replace('\'', "''");
-    let volume = volume.clamp(0.0, 1.0);
+    let (stream, handle) = rodio::OutputStream::try_default()
+        .map_err(|error| format!(
+            "Falha ao abrir a saída de áudio do Windows via WASAPI: {error}. O Faxina não depende do Windows Media Player."
+        ))?;
+    let sink = rodio::Sink::try_new(&handle)
+        .map_err(|error| format!("Falha ao criar o canal de reprodução: {error}"))?;
 
-    let script = format!(
-        r#"$ErrorActionPreference='Stop'
-$mediaPath='{media}'
-$controlPath='{control}'
-$statusPath='{status}'
-try {{
-  Add-Type -AssemblyName PresentationCore
-  $player = New-Object System.Windows.Media.MediaPlayer
-  $player.Open([Uri]::new($mediaPath))
-  $deadline=(Get-Date).AddSeconds(6)
-  while((Get-Date) -lt $deadline -and -not $player.NaturalDuration.HasTimeSpan -and -not $player.HasAudio) {{
-    Start-Sleep -Milliseconds 80
-  }}
-  if(-not $player.HasAudio -and -not $player.NaturalDuration.HasTimeSpan) {{
-    throw "O mecanismo multimídia do Windows não conseguiu abrir o áudio dentro do tempo limite."
-  }}
-  $player.Position=[TimeSpan]::Zero
-  $player.Volume = [double]::Parse('{volume:.4}', [Globalization.CultureInfo]::InvariantCulture)
-  $player.Play()
-  Start-Sleep -Milliseconds 120
-  Set-Content -LiteralPath $statusPath -Value ('playing|' + $mediaPath) -Encoding UTF8
-  $last=''
-  while($true) {{
-    if(Test-Path -LiteralPath $controlPath) {{
-      $cmd=(Get-Content -LiteralPath $controlPath -Raw -ErrorAction SilentlyContinue).Trim()
-      if($cmd -and $cmd -ne $last) {{
-        if($cmd -eq 'pause') {{
-          $player.Pause()
-          Set-Content -LiteralPath $statusPath -Value 'paused' -Encoding UTF8
-        }} elseif($cmd -eq 'play') {{
-          $player.Play()
-          Set-Content -LiteralPath $statusPath -Value 'playing' -Encoding UTF8
-        }} elseif($cmd -eq 'stop') {{
-          break
-        }} elseif($cmd.StartsWith('volume=')) {{
-          $raw=$cmd.Substring(7)
-          $player.Volume=[double]::Parse($raw,[Globalization.CultureInfo]::InvariantCulture)
-        }}
-        $last=$cmd
-      }}
-    }}
-    if($player.NaturalDuration.HasTimeSpan -and $player.Position -ge $player.NaturalDuration.TimeSpan) {{
-      break
-    }}
-    Start-Sleep -Milliseconds 120
-  }}
-  $player.Stop()
-  $player.Close()
-  Set-Content -LiteralPath $statusPath -Value 'finished' -Encoding UTF8
-  exit 0
-}} catch {{
-  Set-Content -LiteralPath $statusPath -Value ('error=' + $_.Exception.ToString()) -Encoding UTF8
-  exit 1
-}}"#
-    );
-
-    let mut command = Command::new("powershell.exe");
-    command
-        .args([
-            "-NoProfile",
-            "-STA",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            &script,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
-
-    let child = command
-        .spawn()
-        .map_err(|error| format!("Falha ao iniciar player do Windows: {error}"))?;
+    sink.set_volume(volume.clamp(0.0, 1.0));
+    sink.append(source);
+    sink.play();
 
     Ok(AboutAudio {
-        child,
-        control_path,
-        status_path,
+        _stream: stream,
+        sink,
         paused: false,
     })
 }
@@ -3240,13 +3180,33 @@ Get-VpnConnection | Format-List * | Out-String -Width 300
 
 #[cfg(windows)]
 fn set_window_opacity(transparency: u8) {
+    let title: Vec<u16> = "Apocalipse Faxina\0".encode_utf16().collect();
+
     unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_null() { return; }
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            diagnostics::event(
+                "appearance_opacity_error",
+                "Janela do Apocalipse Faxina não encontrada para aplicar transparência",
+                serde_json::json!({"transparency": transparency}),
+            );
+            return;
+        }
+
         let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as i32);
+        let previous = SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as i32);
         let alpha = ((100u16.saturating_sub(transparency as u16)) * 255 / 100) as u8;
-        let _ = SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+        let ok = SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+
+        diagnostics::event(
+            if ok != 0 { "appearance_opacity" } else { "appearance_opacity_error" },
+            if ok != 0 { "Transparência aplicada à janela correta" } else { "Falha ao aplicar transparência" },
+            serde_json::json!({
+                "transparency": transparency,
+                "alpha": alpha,
+                "previous_ex_style": previous
+            }),
+        );
     }
 }
 
