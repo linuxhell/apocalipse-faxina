@@ -254,6 +254,23 @@ impl FaxinaApp {
         }
     }
 
+    fn elevated_with_network_backup(&mut self, label: &str, command: &str) {
+        match backup_network_config() {
+            Ok(path) => {
+                self.elevated_cmd(label, command);
+                self.last_output.push_str(&format!(
+                    "\n\nBackup preventivo da configuração de rede salvo em:\n{}",
+                    path.display()
+                ));
+            }
+            Err(e) => {
+                self.last_output = format!(
+                    "A ação não foi iniciada porque o backup preventivo da rede falhou.\nErro: {e}"
+                );
+            }
+        }
+    }
+
     fn header(&self, ui: &mut egui::Ui) {
         let t = &themes()[self.theme_index];
         ui.horizontal(|ui| {
@@ -508,16 +525,70 @@ impl FaxinaApp {
     }
 
     fn page_repair_internet(&mut self, ui: &mut egui::Ui) {
-        ui.label("Os resets mais invasivos ficam separados para não apagar proxy/VPN/configuração manual sem necessidade.");
+        ui.label("Diagnostique primeiro. Resets mais invasivos ficam separados para não alterar proxy, VPN ou configuração manual sem necessidade.");
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Diagnóstico IP").clicked() { self.capture("IPConfig", "ipconfig.exe", &["/all"]); }
-            if ui.button("Reparo rápido").clicked() { self.elevated_cmd("Reparo rápido", "ipconfig /flushdns && ipconfig /registerdns"); }
-            if ui.button("Reparo completo").clicked() {
-                self.elevated_cmd("Reparo completo", "ipconfig /flushdns && ipconfig /release && ipconfig /renew && ipconfig /registerdns && netsh winsock reset && netsh int ip reset");
+            if ui.button("Diagnóstico completo").clicked() {
+                self.busy_label = "Diagnóstico de rede".into();
+                self.last_output = network_diagnostics();
+                self.busy_label.clear();
             }
-            if ui.button("Reset Winsock").clicked() { self.elevated_cmd("Winsock", "netsh winsock reset"); }
-            if ui.button("Reset TCP/IP").clicked() { self.elevated_cmd("TCP/IP", "netsh int ip reset"); }
+            if ui.button("Salvar configuração atual").clicked() {
+                self.last_output = match backup_network_config() {
+                    Ok(path) => format!("Backup da configuração de rede salvo em:\n{}", path.display()),
+                    Err(e) => format!("Falha ao salvar backup de rede: {e}"),
+                };
+            }
         });
+
+        ui.separator();
+        ui.strong("Reparo normal");
+        ui.label("O reparo completo NÃO redefine proxy WinHTTP e não reinicia o Windows automaticamente.");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Reparo rápido").clicked() {
+                self.elevated_cmd("Reparo rápido", "ipconfig /flushdns && ipconfig /registerdns");
+            }
+            if ui.button("Reparo completo").clicked() {
+                self.elevated_with_network_backup(
+                    "Reparo completo",
+                    "ipconfig /flushdns && ipconfig /release && ipconfig /renew && ipconfig /registerdns && netsh winsock reset && netsh int ip reset"
+                );
+            }
+        });
+
+        ui.separator();
+        ui.strong("Reparo avançado — ações separadas");
+        ui.label("Use somente a correção necessária. Ações que redefinem a pilha de rede fazem backup preventivo antes de executar.");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Limpar DNS").clicked() {
+                self.elevated_cmd("Limpar DNS", "ipconfig /flushdns");
+            }
+            if ui.button("Registrar DNS").clicked() {
+                self.elevated_cmd("Registrar DNS", "ipconfig /registerdns");
+            }
+            if ui.button("Renovar IP").clicked() {
+                self.elevated_cmd("Renovar IP", "ipconfig /release && ipconfig /renew");
+            }
+            if ui.button("Limpar ARP").clicked() {
+                self.elevated_cmd("Limpar ARP", "arp -d *");
+            }
+            if ui.button("Reset Winsock").clicked() {
+                self.elevated_with_network_backup("Reset Winsock", "netsh winsock reset");
+            }
+            if ui.button("Reset TCP/IP").clicked() {
+                self.elevated_with_network_backup("Reset TCP/IP", "netsh int ip reset");
+            }
+            if ui.button("Restaurar proxy WinHTTP").clicked() {
+                self.elevated_with_network_backup("Restaurar proxy WinHTTP", "netsh winhttp reset proxy");
+            }
+            if ui.button("Reiniciar adaptadores físicos").clicked() {
+                self.elevated_cmd(
+                    "Reiniciar adaptadores",
+                    "powershell -NoProfile -Command \"Get-NetAdapter | Where-Object {$_.HardwareInterface -and $_.Status -ne 'Disabled'} | Restart-NetAdapter -Confirm:$false\""
+                );
+            }
+        });
+
+        ui.small("Winsock/TCP-IP podem exigir reinicialização para concluir. O Apocalipse Faxina apenas informa; nunca reinicia sem confirmação do usuário.");
         output_box(ui, &self.last_output);
     }
 
@@ -776,6 +847,99 @@ fn spawn_elevated_cmd(command: &str) -> std::io::Result<()> {
     { c.creation_flags(CREATE_NO_WINDOW); }
     c.spawn()?.wait()?;
     Ok(())
+}
+
+fn append_report_section(out: &mut String, title: &str, body: String) {
+    out.push_str("\n========================================\n");
+    out.push_str(title);
+    out.push_str("\n========================================\n");
+    out.push_str(body.trim());
+    out.push('\n');
+}
+
+fn network_diagnostics() -> String {
+    let mut out = String::from("DIAGNÓSTICO DE REDE — APOCALIPSE FAXINA\n");
+    append_report_section(&mut out, "CONFIGURAÇÃO IP / DNS / GATEWAY", run_capture("ipconfig.exe", &["/all"]));
+    append_report_section(&mut out, "ROTAS IPv4", run_capture("route.exe", &["print", "-4"]));
+    append_report_section(&mut out, "RESOLUÇÃO DE NOMES", run_capture("nslookup.exe", &["example.com"]));
+    append_report_section(&mut out, "CONECTIVIDADE IP (ICMP PODE SER BLOQUEADO)", run_capture("ping.exe", &["1.1.1.1", "-n", "2"]));
+    append_report_section(&mut out, "PROXY WINHTTP", run_capture("netsh.exe", &["winhttp", "show", "proxy"]));
+
+    let ps = r#"
+$ErrorActionPreference='SilentlyContinue'
+'--- Adaptadores ---'
+Get-NetAdapter | Select-Object Name,InterfaceDescription,Status,LinkSpeed,MacAddress | Format-Table -AutoSize | Out-String -Width 240
+'--- DNS configurado ---'
+Get-DnsClientServerAddress | Where-Object {$_.ServerAddresses.Count -gt 0} | Select-Object InterfaceAlias,AddressFamily,@{N='ServidoresDNS';E={$_.ServerAddresses -join ', '}} | Format-Table -AutoSize | Out-String -Width 240
+'--- Gateway padrão ---'
+Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 5 InterfaceAlias,NextHop,RouteMetric | Format-Table -AutoSize | Out-String -Width 240
+'--- Teste HTTPS ---'
+Test-NetConnection -ComputerName 'www.microsoft.com' -Port 443 -InformationLevel Detailed | Select-Object ComputerName,RemoteAddress,RemotePort,TcpTestSucceeded | Format-List | Out-String -Width 240
+'--- Proxy do usuário ---'
+Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' | Select-Object ProxyEnable,ProxyServer,AutoConfigURL | Format-List | Out-String -Width 240
+'--- VPNs ---'
+Get-VpnConnection | Select-Object Name,ServerAddress,TunnelType,ConnectionStatus | Format-Table -AutoSize | Out-String -Width 240
+"#;
+    append_report_section(&mut out, "ADAPTADORES / DNS / GATEWAY / HTTPS / PROXY / VPN", run_capture("powershell.exe", &["-NoProfile", "-Command", ps]));
+    out
+}
+
+fn backup_network_config() -> std::io::Result<PathBuf> {
+    let raw_stamp = run_capture(
+        "powershell.exe",
+        &["-NoProfile", "-Command", "Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'"],
+    );
+    let mut stamp: String = raw_stamp
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+
+    if stamp.len() < 10 {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        stamp = format!("rede-{secs}");
+    }
+
+    let dir = portable_root()
+        .join("backups")
+        .join("network")
+        .join(stamp);
+    fs::create_dir_all(&dir)?;
+
+    fs::write(dir.join("ipconfig-all.txt"), run_capture("ipconfig.exe", &["/all"]))?;
+    fs::write(dir.join("routes-ipv4.txt"), run_capture("route.exe", &["print", "-4"]))?;
+    fs::write(
+        dir.join("proxy-winhttp.txt"),
+        run_capture("netsh.exe", &["winhttp", "show", "proxy"]),
+    )?;
+
+    let ps = r#"
+$ErrorActionPreference='SilentlyContinue'
+'--- IP ---'
+Get-NetIPConfiguration | Format-List * | Out-String -Width 300
+'--- DNS ---'
+Get-DnsClientServerAddress | Format-Table -AutoSize | Out-String -Width 300
+'--- Adaptadores ---'
+Get-NetAdapter | Select-Object Name,InterfaceDescription,Status,MacAddress,LinkSpeed | Format-Table -AutoSize | Out-String -Width 300
+'--- Proxy do usuário ---'
+Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' | Select-Object ProxyEnable,ProxyServer,AutoConfigURL | Format-List | Out-String -Width 300
+'--- VPNs ---'
+Get-VpnConnection | Format-List * | Out-String -Width 300
+"#;
+    fs::write(
+        dir.join("configuracao-powershell.txt"),
+        run_capture("powershell.exe", &["-NoProfile", "-Command", ps]),
+    )?;
+
+    fs::write(
+        dir.join("manifesto.txt"),
+        "Backup preventivo criado pelo Apocalipse Faxina antes de reparos de rede.\nContém somente diagnóstico/configuração para consulta e recuperação manual.\n",
+    )?;
+
+    Ok(dir)
 }
 
 #[cfg(windows)]
