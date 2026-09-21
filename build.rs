@@ -84,8 +84,7 @@ fn main() {
         println!("cargo:warning=about-theme.mp3 ausente; build sera gerado sem trilha embutida");
     }
 
-    #[cfg(windows)]
-    {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let icon = out.join("apocalipse-faxina.ico");
         make_icon(&icon).expect("falha ao gerar icone");
         let mut res = winresource::WindowsResource::new();

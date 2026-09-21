@@ -1,0 +1,57 @@
+name: Build Windows x64 GNU Fallback
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  windows-gnu-x64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Instalar toolchain cruzado
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 ffmpeg curl
+
+      - name: Preparar mídia embutida
+        run: |
+          mkdir -p assets
+          curl -L --fail "https://raw.githubusercontent.com/linuxhell/apocalipse-download-manager/main/apps/desktop/src-tauri/assets/about-background.jpg" -o assets/about-background.jpg
+          curl -L --fail "https://raw.githubusercontent.com/linuxhell/apocalipse-download-manager/main/apps/desktop/src-tauri/assets/about-creator.jpg" -o assets/about-creator.jpg
+          curl -L --fail "https://raw.githubusercontent.com/linuxhell/apocalipse-download-manager/main/apps/desktop/src-tauri/assets/about-theme.mp4" -o assets/about-theme.mp4
+          ffmpeg -y -i assets/about-theme.mp4 -vn -codec:a libmp3lame -b:a 128k assets/about-theme.mp3
+          test -s assets/about-theme.mp3
+
+      - name: Compilar Windows x64 GNU
+        env:
+          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+          CXX_x86_64_pc_windows_gnu: x86_64-w64-mingw32-g++
+          AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+          WINDRES: x86_64-w64-mingw32-windres
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Preparar portátil
+        run: |
+          mkdir -p dist/Apocalipse-Faxina/{assets,data,config,backups,logs,diagnostics}
+          cp target/x86_64-pc-windows-gnu/release/apocalipse-faxina.exe dist/Apocalipse-Faxina/Apocalipse-Faxina.exe
+          cp assets/about-background.jpg dist/Apocalipse-Faxina/assets/
+          cp assets/about-creator.jpg dist/Apocalipse-Faxina/assets/
+          cp assets/about-theme.mp4 dist/Apocalipse-Faxina/assets/
+          cp assets/about-theme.mp3 dist/Apocalipse-Faxina/assets/
+          printf "Apocalipse Faxina - build Windows x64 GNU de contingência\n" > dist/Apocalipse-Faxina/data/LEIA-ME.txt
+
+      - name: Artefato Windows x64 GNU
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apocalipse-Faxina-Windows-x64-GNU
+          path: dist/Apocalipse-Faxina
+          if-no-files-found: error
