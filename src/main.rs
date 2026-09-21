@@ -2098,12 +2098,13 @@ fn clean_directory_contents_report(path: &Path, exclusions: &[String]) -> Vec<St
             if meta.is_dir() {
                 visit(&child, exclusions, failures);
                 match fs::read_dir(&child) {
-                    Ok(mut left) if left.next().is_none() => {
-                        if let Err(error) = fs::remove_dir(&child) {
-                            failures.push(format!("{}: {}", child.display(), error));
+                    Ok(mut left) => {
+                        if left.next().is_none() {
+                            if let Err(error) = fs::remove_dir(&child) {
+                                failures.push(format!("{}: {}", child.display(), error));
+                            }
                         }
                     }
-                    Ok(_) => {}
                     Err(error) => failures.push(format!("{}: {}", child.display(), error)),
                 }
             } else if let Err(error) = fs::remove_file(&child) {
