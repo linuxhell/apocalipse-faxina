@@ -1,8 +1,9 @@
 use serde::Deserialize;
 use std::{
     collections::HashSet,
+    fs,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
@@ -77,6 +78,14 @@ pub struct RegistryOrphan {
     pub checked: bool,
 }
 
+#[derive(Debug)]
+struct RegistryCleanupResult {
+    removed: usize,
+    failed: Vec<String>,
+    backup_dir: PathBuf,
+    elapsed_ms: u128,
+}
+
 #[derive(Default)]
 pub struct WindowsInventory {
     pub tasks: Vec<TaskEntry>,
@@ -86,8 +95,10 @@ pub struct WindowsInventory {
     pub shell_status: String,
     pub registry_status: String,
     pub registry_scanning: bool,
+    pub registry_cleaning: bool,
     registry_scan_rx: Option<Receiver<Result<Vec<RegistryOrphan>, String>>>,
     registry_scan_started: Option<Instant>,
+    registry_cleanup_rx: Option<Receiver<Result<RegistryCleanupResult, String>>>,
 }
 
 impl WindowsInventory {
@@ -797,6 +808,116 @@ if ($items.Count -eq 0) {
         run_json_timeout::<RegistryOrphan>(SCRIPT, Duration::from_secs(30))
     }
 
+
+    pub fn start_registry_cleanup(&mut self, backup_dir: PathBuf) {
+        if self.registry_scanning || self.registry_cleaning {
+            return;
+        }
+
+        let selected: Vec<RegistryOrphan> = self
+            .registry_orphans
+            .iter()
+            .filter(|item| item.checked)
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            self.registry_status = "Nenhuma entrada segura selecionada.".into();
+            return;
+        }
+
+        let selected_count = selected.len();
+        let backup_for_log = backup_dir.clone();
+        let (tx, rx) = mpsc::channel();
+        self.registry_cleanup_rx = Some(rx);
+        self.registry_cleaning = true;
+        self.registry_status = format!(
+            "Criando backup e removendo {} entrada(s) segura(s)…",
+            selected_count
+        );
+
+        crate::diagnostics::operation_start(
+            "registro",
+            "safe_cleanup",
+            serde_json::json!({
+                "selected": selected_count,
+                "backup": backup_for_log.to_string_lossy()
+            }),
+        );
+
+        thread::spawn(move || {
+            let result = cleanup_registry_items(selected, backup_dir);
+            let _ = tx.send(result);
+        });
+    }
+
+    pub fn poll_registry_cleanup(&mut self) {
+        let result = match self.registry_cleanup_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) => return,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.registry_cleanup_rx = None;
+                self.registry_cleaning = false;
+                self.registry_status =
+                    "A limpeza do Registro terminou inesperadamente; nenhuma nova remoção será tentada até você executar outra varredura."
+                        .into();
+                crate::diagnostics::operation_end(
+                    "registro",
+                    "safe_cleanup",
+                    false,
+                    0,
+                    serde_json::json!({"error":"worker desconectado"}),
+                );
+                return;
+            }
+            None => return,
+        };
+
+        self.registry_cleanup_rx = None;
+        self.registry_cleaning = false;
+
+        match result {
+            Ok(result) => {
+                let ok = result.failed.is_empty();
+                self.registry_status = if ok {
+                    format!(
+                        "{} entrada(s) removida(s). Reanalisando o Registro para confirmar o resultado…",
+                        result.removed
+                    )
+                } else {
+                    format!(
+                        "{} entrada(s) removida(s), {} falha(s). Reanalisando para mostrar somente o que realmente permaneceu.",
+                        result.removed,
+                        result.failed.len()
+                    )
+                };
+
+                crate::diagnostics::operation_end(
+                    "registro",
+                    "safe_cleanup",
+                    ok,
+                    result.elapsed_ms,
+                    serde_json::json!({
+                        "removed": result.removed,
+                        "failed": result.failed,
+                        "backup": result.backup_dir.to_string_lossy()
+                    }),
+                );
+
+                self.scan_registry_orphans();
+            }
+            Err(error) => {
+                self.registry_status = format!("Falha na limpeza segura do Registro: {error}");
+                crate::diagnostics::operation_end(
+                    "registro",
+                    "safe_cleanup",
+                    false,
+                    0,
+                    serde_json::json!({"error": error}),
+                );
+            }
+        }
+    }
+
     pub fn registry_cleanup_command(&self, backup_dir: &Path) -> Option<(String, String)> {
         let selected: Vec<&RegistryOrphan> =
             self.registry_orphans.iter().filter(|x| x.checked).collect();
@@ -956,6 +1077,181 @@ where
 
     serde_json::from_str(&stdout)
         .map_err(|error| format!("Falha ao interpretar Varredura Segura: {error}\n{stdout}"))
+}
+
+fn cleanup_registry_items(
+    selected: Vec<RegistryOrphan>,
+    backup_dir: PathBuf,
+) -> Result<RegistryCleanupResult, String> {
+    let started = Instant::now();
+    fs::create_dir_all(&backup_dir)
+        .map_err(|error| format!("Falha ao criar pasta de backup: {error}"))?;
+
+    let mut manifest = String::from(
+        "BACKUP DE REGISTRO — APOCALIPSE FAXINA\nMODO: VARREDURA SEGURA\n\n",
+    );
+    let mut backed_up = HashSet::new();
+    let mut backup_failed = HashSet::new();
+    let mut failures = Vec::new();
+    let mut removed = 0usize;
+
+    for (index, item) in selected.iter().enumerate() {
+        manifest.push_str(&format!(
+            "{}\nCategoria: {}\nTipo: {}\nChave: {}\nValor: {}\nAlvo: {}\nMotivo: {}\nEvidência: {}\n\n",
+            index + 1,
+            item.category,
+            item.kind,
+            item.reg_path,
+            if item.value_name.is_empty() {
+                "(Padrão)"
+            } else {
+                &item.value_name
+            },
+            item.target,
+            item.reason,
+            item.evidence
+        ));
+
+        if !backed_up.contains(&item.reg_path) && !backup_failed.contains(&item.reg_path) {
+            let file = backup_dir.join(format!("chave-{:03}.reg", backed_up.len() + 1));
+            let file_text = file.to_string_lossy().to_string();
+            match run_reg(&[
+                "export".to_string(),
+                item.reg_path.clone(),
+                file_text,
+                "/y".to_string(),
+            ]) {
+                Ok(_) => {
+                    backed_up.insert(item.reg_path.clone());
+                }
+                Err(error) => {
+                    // Se a chave já desapareceu entre a análise e a limpeza, não há nada a remover.
+                    if run_reg(&["query".to_string(), item.reg_path.clone()]).is_err() {
+                        removed = removed.saturating_add(1);
+                        continue;
+                    }
+                    backup_failed.insert(item.reg_path.clone());
+                    failures.push(format!(
+                        "{}: backup falhou, portanto a remoção foi bloqueada: {}",
+                        item.reg_path, error
+                    ));
+                    continue;
+                }
+            }
+        }
+
+        if backup_failed.contains(&item.reg_path) {
+            continue;
+        }
+
+        let mut args = vec!["delete".to_string(), item.reg_path.clone()];
+        if item.kind != "Key" {
+            if item.value_name.is_empty() {
+                args.push("/ve".to_string());
+            } else {
+                args.push("/v".to_string());
+                args.push(item.value_name.clone());
+            }
+        }
+        args.push("/f".to_string());
+
+        match run_reg(&args) {
+            Ok(_) => {
+                removed = removed.saturating_add(1);
+                crate::diagnostics::event(
+                    "registry_cleanup_item",
+                    "Entrada segura removida",
+                    serde_json::json!({
+                        "category": item.category,
+                        "kind": item.kind,
+                        "reg_path": item.reg_path,
+                        "value_name": item.value_name
+                    }),
+                );
+            }
+            Err(error) => {
+                // Se já não existe, o objetivo da limpeza já foi alcançado.
+                let already_absent = if item.kind == "Key" {
+                    run_reg(&["query".to_string(), item.reg_path.clone()]).is_err()
+                } else {
+                    let mut query = vec!["query".to_string(), item.reg_path.clone()];
+                    if item.value_name.is_empty() {
+                        query.push("/ve".to_string());
+                    } else {
+                        query.push("/v".to_string());
+                        query.push(item.value_name.clone());
+                    }
+                    run_reg(&query).is_err()
+                };
+
+                if already_absent {
+                    removed = removed.saturating_add(1);
+                } else {
+                    failures.push(format!(
+                        "{}{}: {}",
+                        item.reg_path,
+                        if item.value_name.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" -> {}", item.value_name)
+                        },
+                        error
+                    ));
+                }
+            }
+        }
+    }
+
+    manifest.push_str("\nRESULTADO\n");
+    manifest.push_str(&format!("Removidas/ausentes: {}\n", removed));
+    manifest.push_str(&format!("Falhas: {}\n", failures.len()));
+    for failure in &failures {
+        manifest.push_str("- ");
+        manifest.push_str(failure);
+        manifest.push('\n');
+    }
+    fs::write(backup_dir.join("manifesto.txt"), manifest)
+        .map_err(|error| format!("Falha ao gravar manifesto do backup: {error}"))?;
+
+    Ok(RegistryCleanupResult {
+        removed,
+        failed: failures,
+        backup_dir,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+fn run_reg(args: &[String]) -> Result<String, String> {
+    let mut command = Command::new("reg.exe");
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let output = command
+        .output()
+        .map_err(|error| format!("Falha ao executar reg.exe: {error}"))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&stderr);
+    }
+
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err(format!(
+            "reg.exe terminou com código {:?}: {}",
+            output.status.code(),
+            text.trim()
+        ))
+    }
 }
 
 fn ps_quote(value: &str) -> String {

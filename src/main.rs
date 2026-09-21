@@ -1124,6 +1124,15 @@ impl FaxinaApp {
             if ui.add_enabled(self.defrag.running, egui::Button::new("Parar")).clicked() {
                 self.defrag.cancel();
             }
+            if ui
+                .add_enabled(
+                    !self.defrag.output.trim().is_empty(),
+                    egui::Button::new("Abrir log técnico"),
+                )
+                .clicked()
+            {
+                self.defrag.show_log = true;
+            }
         });
 
         if self.defrag.running || self.defrag.progress > 0.0 {
@@ -1214,15 +1223,53 @@ impl FaxinaApp {
         }
 
         if !self.defrag.output.trim().is_empty() {
-            egui::CollapsingHeader::new("Log técnico do defrag.exe (opcional)")
+            egui::CollapsingHeader::new("Prévia do log técnico do defrag.exe")
                 .default_open(false)
                 .show(ui, |ui| {
-                    ui.small("O Windows pode relatar internamente que está 'invocando otimizar novamente' ao executar /O. Isso faz parte da estratégia escolhida pelo próprio defrag.exe e não significa que o Faxina enviou a unidade duas vezes.");
-                    output_box(ui, &self.defrag.output);
+                    ui.small("Use “Abrir log técnico” para ver o conteúdo completo em uma janela independente com rolagem própria.");
+                    egui::ScrollArea::vertical()
+                        .id_salt("defrag_log_preview")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.defrag.output.clone())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(8)
+                                    .interactive(false),
+                            );
+                        });
                 });
         }
     
             });
+
+        if self.defrag.show_log {
+            let mut open = self.defrag.show_log;
+            let mut log_text = self.defrag.output.clone();
+            egui::Window::new("Log técnico — Discos / SSD")
+                .open(&mut open)
+                .resizable(true)
+                .default_size(egui::vec2(900.0, 560.0))
+                .min_size(egui::vec2(520.0, 300.0))
+                .show(ui.ctx(), |ui| {
+                    ui.small("Saída completa do defrag.exe. Esta janela possui rolagem vertical e horizontal independentes da página Discos/SSD.");
+                    ui.separator();
+                    egui::ScrollArea::both()
+                        .id_salt("defrag_full_log")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut log_text)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(32)
+                                    .interactive(false),
+                            );
+                        });
+                });
+            self.defrag.show_log = open;
+        }
     }
 
 
@@ -1454,8 +1501,9 @@ impl FaxinaApp {
     }
 
     fn page_registry(&mut self, ui: &mut egui::Ui) {
+        self.inventory.poll_registry_cleanup();
         self.inventory.poll_registry_scan();
-        if self.inventory.registry_scanning {
+        if self.inventory.registry_scanning || self.inventory.registry_cleaning {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
         }
 
@@ -1466,9 +1514,11 @@ impl FaxinaApp {
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
-                    !self.inventory.registry_scanning,
+                    !self.inventory.registry_scanning && !self.inventory.registry_cleaning,
                     egui::Button::new(if self.inventory.registry_scanning {
                         "Analisando Registro…"
+                    } else if self.inventory.registry_cleaning {
+                        "Limpando Registro…"
                     } else {
                         "Varredura segura"
                     }),
@@ -1496,16 +1546,21 @@ impl FaxinaApp {
             }
         });
 
-        if self.inventory.registry_scanning {
+        if self.inventory.registry_scanning || self.inventory.registry_cleaning {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Verificando locais seguros em segundo plano…");
+                ui.label(if self.inventory.registry_cleaning {
+                    "Criando backups e removendo entradas seguras em segundo plano…"
+                } else {
+                    "Verificando locais seguros em segundo plano…"
+                });
             });
         }
 
         if ui
             .add_enabled(
                 !self.inventory.registry_scanning
+                    && !self.inventory.registry_cleaning
                     && self.inventory.registry_orphans.iter().any(|x| x.checked),
                 egui::Button::new("Backup + remover seguros selecionados"),
             )
@@ -1515,32 +1570,7 @@ impl FaxinaApp {
                 .join("backups")
                 .join("registry")
                 .join(timestamp_slug());
-            match fs::create_dir_all(&backup) {
-                Ok(_) => {
-                    if let Some((command, manifest)) =
-                        self.inventory.registry_cleanup_command(&backup)
-                    {
-                        let _ = fs::write(backup.join("manifesto.txt"), manifest);
-                        diagnostics::event(
-                            "registry_cleanup",
-                            "Limpeza segura do Registro iniciada",
-                            serde_json::json!({
-                                "selected": self.inventory.registry_orphans.iter().filter(|x| x.checked).count(),
-                                "backup": backup.to_string_lossy()
-                            }),
-                        );
-                        self.elevated_cmd("Limpeza segura do Registro", &command);
-                        self.last_output.push_str(&format!(
-                            "\n\nBackup .reg e manifesto salvos em:\n{}",
-                            backup.display()
-                        ));
-                    }
-                }
-                Err(error) => {
-                    self.last_output =
-                        format!("A limpeza não foi iniciada: falha ao criar backup: {error}");
-                }
-            }
+            self.inventory.start_registry_cleanup(backup);
         }
 
         ui.label(&self.inventory.registry_status);

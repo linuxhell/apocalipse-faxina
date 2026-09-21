@@ -11,11 +11,19 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW:u32=0x08000000;
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum OptimizationMode{Intelligent,Quick,CompleteHdd,ConsolidateFree,HddDefrag,Retrim}
+pub enum OptimizationMode{Intelligent,Quick,SolidCompleteSsd,CompleteHdd,ConsolidateFree,HddDefrag,Retrim}
 impl OptimizationMode{
- pub const ALL:[Self;6]=[Self::Intelligent,Self::Quick,Self::CompleteHdd,Self::ConsolidateFree,Self::HddDefrag,Self::Retrim];
- pub fn label(self)->&'static str{match self{Self::Intelligent=>"Inteligente / recomendado",Self::Quick=>"Rápido",Self::CompleteHdd=>"Completo para HDD",Self::ConsolidateFree=>"Consolidar espaço livre",Self::HddDefrag=>"Desfragmentar HDD",Self::Retrim=>"ReTRIM SSD/NVMe"}}
- pub fn description(self)->&'static str{match self{Self::Intelligent=>"Windows escolhe a otimização adequada à mídia (/O).",Self::Quick=>"HDD: desfragmentação direta; SSD/NVMe: ReTRIM.",Self::CompleteHdd=>"HDD: desfragmenta e depois consolida espaço livre.",Self::ConsolidateFree=>"HDD: consolida espaço livre (/X).",Self::HddDefrag=>"HDD: desfragmentação tradicional (/D).",Self::Retrim=>"SSD/NVMe: ReTRIM (/L), sem desfragmentação agressiva."}}
+ pub const ALL:[Self;7]=[Self::Intelligent,Self::Quick,Self::SolidCompleteSsd,Self::CompleteHdd,Self::ConsolidateFree,Self::HddDefrag,Self::Retrim];
+ pub fn label(self)->&'static str{match self{Self::Intelligent=>"Inteligente / recomendado",Self::Quick=>"Rápido",Self::SolidCompleteSsd=>"SSD SOLID/Complete inspirado",Self::CompleteHdd=>"Completo para HDD",Self::ConsolidateFree=>"Consolidar espaço livre",Self::HddDefrag=>"Desfragmentar HDD",Self::Retrim=>"ReTRIM SSD/NVMe"}}
+ pub fn description(self)->&'static str{match self{
+  Self::Intelligent=>"SSD/NVMe: estratégia SOLID/Complete inspirada (/D → /X → /L). HDD: otimização adequada do Windows (/O).",
+  Self::Quick=>"HDD: desfragmentação direta; SSD/NVMe: ReTRIM.",
+  Self::SolidCompleteSsd=>"SSD/NVMe: reúne fragmentos, consolida espaço livre e finaliza com ReTRIM. Inspirado no conceito SOLID/Complete da O&O; usa somente rotinas nativas do Windows.",
+  Self::CompleteHdd=>"HDD: desfragmenta e depois consolida espaço livre.",
+  Self::ConsolidateFree=>"HDD: consolida espaço livre (/X).",
+  Self::HddDefrag=>"HDD: desfragmentação tradicional (/D).",
+  Self::Retrim=>"SSD/NVMe: ReTRIM (/L), sem consolidação completa."
+ }}
 }
 #[derive(Clone,Debug,Default)]
 pub struct VolumeInfo{pub drive:String,pub label:String,pub file_system:String,pub health:String,pub media_type:String,pub bus_type:String,pub size:u64,pub free:u64}
@@ -29,11 +37,11 @@ enum Event{Detected(Result<Vec<VolumeInfo>,String>),Progress(f32,String,String),
 
 pub struct DefragState{
  pub selected_mode:usize,pub volumes:Vec<VolumeChoice>,pub reports:Vec<DriveReport>,pub running:bool,pub detecting:bool,
- pub progress:f32,pub phase:String,pub status:String,pub output:String,pub current_drive:String,
+ pub progress:f32,pub phase:String,pub status:String,pub output:String,pub current_drive:String,pub show_log:bool,
  rx:Option<Receiver<Event>>,cancel:Arc<AtomicBool>,
 }
 impl Default for DefragState{
- fn default()->Self{Self{selected_mode:0,volumes:vec![],reports:vec![],running:false,detecting:false,progress:0.0,phase:"Pronto".into(),status:"Detectando unidades…".into(),output:String::new(),current_drive:String::new(),rx:None,cancel:Arc::new(AtomicBool::new(false))}}
+ fn default()->Self{Self{selected_mode:0,volumes:vec![],reports:vec![],running:false,detecting:false,progress:0.0,phase:"Pronto".into(),status:"Detectando unidades…".into(),output:String::new(),current_drive:String::new(),show_log:false,rx:None,cancel:Arc::new(AtomicBool::new(false))}}
 }
 impl DefragState{
  pub fn selected_mode(&self)->OptimizationMode{OptimizationMode::ALL.get(self.selected_mode).copied().unwrap_or(OptimizationMode::Intelligent)}
@@ -114,11 +122,37 @@ fn clean_technical_output(output:&str)->String{
 }
 
 fn validate_mode(mode:OptimizationMode,info:&VolumeInfo)->Result<(),String>{
- let ssd=is_ssd(info);let hdd=info.media_type.to_ascii_lowercase().contains("hdd")||info.media_type.to_ascii_lowercase().contains("hard disk");
- match mode{OptimizationMode::CompleteHdd|OptimizationMode::ConsolidateFree|OptimizationMode::HddDefrag if ssd=>Err(format!("{} bloqueado em {} porque a unidade foi identificada como SSD/NVMe.",mode.label(),info.drive)),OptimizationMode::Retrim if hdd=>Err(format!("ReTRIM bloqueado em {} porque foi identificado como HDD.",info.drive)),_=>Ok(())}
+ let ssd=is_ssd(info);
+ let hdd=info.media_type.to_ascii_lowercase().contains("hdd")||info.media_type.to_ascii_lowercase().contains("hard disk");
+ match mode{
+  OptimizationMode::SolidCompleteSsd if !ssd=>Err(format!("{} bloqueado em {} porque a unidade não foi identificada como SSD/NVMe.",mode.label(),info.drive)),
+  OptimizationMode::CompleteHdd|OptimizationMode::ConsolidateFree|OptimizationMode::HddDefrag if ssd=>Err(format!("{} bloqueado em {} porque a unidade foi identificada como SSD/NVMe.",mode.label(),info.drive)),
+  OptimizationMode::Retrim if hdd=>Err(format!("ReTRIM bloqueado em {} porque foi identificado como HDD.",info.drive)),
+  _=>Ok(())
+ }
 }
 fn is_ssd(info:&VolumeInfo)->bool{let m=info.media_type.to_ascii_lowercase();let b=info.bus_type.to_ascii_lowercase();m.contains("ssd")||m.contains("solid")||b.contains("nvme")}
-fn commands_for(mode:OptimizationMode,info:&VolumeInfo)->Vec<Vec<String>>{match mode{OptimizationMode::Intelligent=>vec![vec!["/O".into(),"/U".into(),"/V".into()]],OptimizationMode::Quick if is_ssd(info)=>vec![vec!["/L".into(),"/U".into()]],OptimizationMode::Quick=>vec![vec!["/D".into(),"/U".into()]],OptimizationMode::CompleteHdd=>vec![vec!["/D".into(),"/U".into(),"/V".into()],vec!["/X".into(),"/U".into(),"/V".into()]],OptimizationMode::ConsolidateFree=>vec![vec!["/X".into(),"/U".into(),"/V".into()]],OptimizationMode::HddDefrag=>vec![vec!["/D".into(),"/U".into(),"/V".into()]],OptimizationMode::Retrim=>vec![vec!["/L".into(),"/U".into(),"/V".into()]]}}
+fn commands_for(mode:OptimizationMode,info:&VolumeInfo)->Vec<Vec<String>>{
+ let solid_complete_ssd=||vec![
+  vec!["/D".into(),"/U".into(),"/V".into()],
+  vec!["/X".into(),"/U".into(),"/V".into()],
+  vec!["/L".into(),"/U".into(),"/V".into()],
+ ];
+ match mode{
+  OptimizationMode::Intelligent if is_ssd(info)=>solid_complete_ssd(),
+  OptimizationMode::Intelligent=>vec![vec!["/O".into(),"/U".into(),"/V".into()]],
+  OptimizationMode::Quick if is_ssd(info)=>vec![vec!["/L".into(),"/U".into(),"/V".into()]],
+  OptimizationMode::Quick=>vec![vec!["/D".into(),"/U".into()]],
+  OptimizationMode::SolidCompleteSsd=>solid_complete_ssd(),
+  OptimizationMode::CompleteHdd=>vec![
+   vec!["/D".into(),"/U".into(),"/V".into()],
+   vec!["/X".into(),"/U".into(),"/V".into()]
+  ],
+  OptimizationMode::ConsolidateFree=>vec![vec!["/X".into(),"/U".into(),"/V".into()]],
+  OptimizationMode::HddDefrag=>vec![vec!["/D".into(),"/U".into(),"/V".into()]],
+  OptimizationMode::Retrim=>vec![vec!["/L".into(),"/U".into(),"/V".into()]]
+ }
+}
 
 fn query_all_volumes()->Result<Vec<VolumeInfo>,String>{
  let script=r#"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
