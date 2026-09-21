@@ -19,7 +19,6 @@ use std::{
     collections::HashMap,
     env,
     fs,
-    io::BufReader,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -177,7 +176,6 @@ struct FaxinaApp {
     startup: startup::StartupState,
     services: services::ServiceState,
     hide_microsoft_services: bool,
-    service_user_only: bool,
     task_view_windows: bool,
     show_windows_shell: bool,
     busy_label: String,
@@ -185,6 +183,7 @@ struct FaxinaApp {
     about_creator: Option<egui::TextureHandle>,
     about_audio: Option<AboutAudio>,
     about_volume: f32,
+    diagnostic_export: diagnostics::ExportState,
 }
 
 impl FaxinaApp {
@@ -222,7 +221,6 @@ impl FaxinaApp {
             startup: startup::StartupState::default(),
             services: services::ServiceState::default(),
             hide_microsoft_services: true,
-            service_user_only: false,
             task_view_windows: false,
             show_windows_shell: false,
             busy_label: String::new(),
@@ -230,6 +228,7 @@ impl FaxinaApp {
             about_creator,
             about_audio: None,
             about_volume: 0.70,
+            diagnostic_export: diagnostics::ExportState::default(),
         };
         app.apply_theme(&cc.egui_ctx);
         set_window_opacity(app.transparency);
@@ -939,6 +938,10 @@ impl FaxinaApp {
     }
 
     fn page_disks(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("disks_page_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
         self.defrag.poll();
         if self.defrag.running || self.defrag.detecting {
             ui.ctx().request_repaint_after(defrag::sleep_repaint_hint());
@@ -1099,6 +1102,8 @@ impl FaxinaApp {
         if !self.defrag.output.trim().is_empty() {
             egui::CollapsingHeader::new("Saída detalhada do Windows").show(ui, |ui| output_box(ui, &self.defrag.output));
         }
+    
+            });
     }
 
 
@@ -1622,10 +1627,6 @@ impl FaxinaApp {
                 &mut self.hide_microsoft_services,
                 "Esconder serviços da Microsoft",
             );
-            ui.checkbox(
-                &mut self.service_user_only,
-                "Somente serviços por usuário atual",
-            );
             if ui.button("Atualizar serviços").clicked() {
                 self.services.scan();
             }
@@ -1643,7 +1644,6 @@ impl FaxinaApp {
             let has_visible_selected = self.services.items.iter().any(|service| {
                 service.checked
                     && (!self.hide_microsoft_services || !service.is_microsoft)
-                    && (!self.service_user_only || service.is_current_user)
             });
             if ui
                 .add_enabled(has_visible_selected, egui::Button::new("Iniciar"))
@@ -1734,7 +1734,6 @@ impl FaxinaApp {
         let removable_selected = self.services.items.iter().any(|service| {
             service.checked
                 && !service.is_microsoft
-                && (!self.service_user_only || service.is_current_user)
         });
         if ui
             .add_enabled(
@@ -1755,9 +1754,6 @@ impl FaxinaApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for service in &mut self.services.items {
                 if self.hide_microsoft_services && service.is_microsoft {
-                    continue;
-                }
-                if self.service_user_only && !service.is_current_user {
                     continue;
                 }
 
@@ -2080,34 +2076,75 @@ impl FaxinaApp {
     }
 
     fn page_diagnostics(&mut self, ui: &mut egui::Ui) {
+        self.diagnostic_export.poll();
+        if self.diagnostic_export.running {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
         let t=themes()[self.theme_index].clone();
         ui.label("Debugger estruturado do Apocalipse Faxina.");
         ui.small("Registra sessão, cliques, mudanças de seção, travamentos da UI, operações, erros e crashes. O ZIP adiciona inventário técnico do Windows.");
+
         egui::Grid::new("diagnostic_summary").num_columns(2).spacing([18.0,8.0]).show(ui,|ui|{
             ui.label("Sessão");ui.strong(diagnostics::session_id());ui.end_row();
             ui.label("Eventos registrados");ui.strong(diagnostics::event_count().to_string());ui.end_row();
             ui.label("Último evento");ui.label(diagnostics::last_event());ui.end_row();
             ui.label("Banco de otimização");ui.label(format!("{} • {} regras de inicialização • {} regras de serviços",optimizer_db::DB_VERSION,optimizer_db::startup_rule_count(),optimizer_db::service_rule_count()));ui.end_row();
         });
+
         ui.label(egui::RichText::new(optimizer_db::DB_SOURCE_NOTE).color(t.muted));
         ui.separator();
+
         ui.horizontal_wrapped(|ui|{
-            if ui.button("Exportar diagnóstico ZIP").clicked(){
-                let started=std::time::Instant::now();diagnostics::operation_start("diagnostico","export_zip",serde_json::json!({}));
-                match diagnostics::export_zip(&portable_root()){
-                    Ok(path)=>{self.last_output=format!("Diagnóstico exportado:\n{}",path.display());diagnostics::operation_end("diagnostico","export_zip",true,started.elapsed().as_millis(),serde_json::json!({"path":path.to_string_lossy()}));}
-                    Err(error)=>{self.last_output=format!("Falha ao exportar diagnóstico: {error}");diagnostics::operation_end("diagnostico","export_zip",false,started.elapsed().as_millis(),serde_json::json!({"error":error}));}
+            if ui
+                .add_enabled(
+                    !self.diagnostic_export.running,
+                    egui::Button::new(if self.diagnostic_export.running {
+                        "Exportando diagnóstico…"
+                    } else {
+                        "Exportar diagnóstico ZIP"
+                    }),
+                )
+                .clicked()
+            {
+                self.diagnostic_export.start(portable_root());
+            }
+
+            if self.diagnostic_export.running {
+                ui.spinner();
+                ui.label("Coletando inventário e criando uma cópia consistente do log em segundo plano…");
+            }
+
+            if ui.button("Abrir pasta de logs").clicked(){
+                if let Some(path)=diagnostics::logs_root(){
+                    let _=Command::new("explorer.exe").arg(path).spawn();
                 }
             }
-            if ui.button("Abrir pasta de logs").clicked(){if let Some(path)=diagnostics::logs_root(){let _=Command::new("explorer.exe").arg(path).spawn();}}
-            if ui.button("Abrir pasta dos ZIPs").clicked(){let path=portable_root().join("diagnostics");let _=fs::create_dir_all(&path);let _=Command::new("explorer.exe").arg(path).spawn();}
+            if ui.button("Abrir pasta dos ZIPs").clicked(){
+                let path=portable_root().join("diagnostics");
+                let _=fs::create_dir_all(&path);
+                let _=Command::new("explorer.exe").arg(path).spawn();
+            }
         });
-        if let Some(path)=diagnostics::session_dir(){ui.small(format!("Sessão atual: {}",path.display()));}
+
+        if !self.diagnostic_export.status.is_empty() {
+            ui.label(
+                egui::RichText::new(&self.diagnostic_export.status)
+                    .color(if self.diagnostic_export.last_ok { t.accent } else { t.text })
+                    .strong(),
+            );
+        }
+        if let Some(path)=&self.diagnostic_export.last_path {
+            ui.small(format!("Último ZIP: {}",path.display()));
+        }
+        if let Some(path)=diagnostics::session_dir(){
+            ui.small(format!("Sessão atual: {}",path.display()));
+        }
         ui.small("Privacidade: senhas, cookies, credenciais e tokens não são coletados intencionalmente.");
-        output_box(ui,&self.last_output);
     }
 
     fn page_about(&mut self, ui: &mut egui::Ui) {
+        self.poll_about_audio();
         let t = themes()[self.theme_index].clone();
 
         ui.label(
@@ -2122,17 +2159,23 @@ impl FaxinaApp {
                 let paused_or_stopped = self
                     .about_audio
                     .as_ref()
-                    .map(|audio| audio.sink.is_paused() || audio.sink.empty())
+                    .map(|audio| audio.paused)
                     .unwrap_or(true);
 
                 if ui.button(if paused_or_stopped { "Tocar" } else { "Pausar" }).clicked() {
-                    if let Some(audio) = &self.about_audio {
-                        if audio.sink.empty() {
-                            self.restart_about_audio();
-                        } else if audio.sink.is_paused() {
-                            audio.sink.play();
+                    if let Some(audio) = &mut self.about_audio {
+                        let result = if audio.paused {
+                            audio.play()
                         } else {
-                            audio.sink.pause();
+                            audio.pause()
+                        };
+                        if let Err(error) = result {
+                            self.last_output = error.clone();
+                            diagnostics::event(
+                                "about_audio_error",
+                                "Falha ao controlar áudio",
+                                serde_json::json!({"error": error}),
+                            );
                         }
                     } else {
                         self.restart_about_audio();
@@ -2148,7 +2191,9 @@ impl FaxinaApp {
                 ui.add(egui::Slider::new(&mut self.about_volume, 0.0..=1.0).show_value(false));
                 if (old_volume - self.about_volume).abs() > f32::EPSILON {
                     if let Some(audio) = &self.about_audio {
-                        audio.sink.set_volume(self.about_volume);
+                        if let Err(error) = audio.set_volume(self.about_volume) {
+                            self.last_output = error;
+                        }
                     }
                 }
 
@@ -2177,8 +2222,6 @@ impl FaxinaApp {
 
         ui.add_space(6.0);
         if let Some(background) = &self.about_background {
-            // O arquivo original contém um player de vídeo no topo direito.
-            // A seção mostra apenas a parte limpa da arte, cortando a faixa superior.
             let available = ui.available_width().max(120.0);
             let [w, h] = background.size();
             let source_ratio = if w == 0 { 0.55 } else { h as f32 / w as f32 };
@@ -2201,26 +2244,65 @@ impl FaxinaApp {
             });
         }
 
-        if !self.last_output.is_empty() && self.last_output.contains("áudio") {
+        if !self.last_output.is_empty() && self.last_output.to_ascii_lowercase().contains("áudio") {
             ui.small(&self.last_output);
         }
     }
 
     fn stop_about_audio(&mut self) {
         if let Some(audio) = self.about_audio.take() {
-            audio.sink.stop();
+            drop(audio);
         }
     }
 
     fn restart_about_audio(&mut self) {
         self.stop_about_audio();
-        let path=portable_root().join("assets").join("about-theme.mp4");
-        diagnostics::event("about_audio","Iniciando áudio da seção Sobre",serde_json::json!({"path":path.to_string_lossy()}));
-        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||start_about_audio(&path,self.about_volume)));
-        match result{
-            Ok(Ok(audio))=>{self.about_audio=Some(audio);diagnostics::event("about_audio","Áudio iniciado",serde_json::json!({}));}
-            Ok(Err(error))=>{self.last_output=error.clone();diagnostics::event("about_audio_error","Falha ao iniciar áudio",serde_json::json!({"error":error}));}
-            Err(_)=>{self.last_output="O backend de áudio falhou, mas o Faxina continuou aberto. Consulte Diagnóstico.".into();diagnostics::event("about_audio_panic","Panic contido no backend de áudio",serde_json::json!({}));}
+        let path = portable_root().join("assets").join("about-theme.mp4");
+        diagnostics::event(
+            "about_audio",
+            "Iniciando áudio da seção Sobre pelo mecanismo multimídia do Windows",
+            serde_json::json!({"path": path.to_string_lossy()}),
+        );
+
+        match start_about_audio(&path, self.about_volume) {
+            Ok(audio) => {
+                self.about_audio = Some(audio);
+                self.last_output.clear();
+                diagnostics::event("about_audio", "Processo de áudio iniciado", serde_json::json!({}));
+            }
+            Err(error) => {
+                self.last_output = error.clone();
+                diagnostics::event(
+                    "about_audio_error",
+                    "Falha ao iniciar áudio",
+                    serde_json::json!({"error": error}),
+                );
+            }
+        }
+    }
+
+    fn poll_about_audio(&mut self) {
+        let finished = self
+            .about_audio
+            .as_mut()
+            .and_then(|audio| audio.poll_finished());
+
+        if let Some((success, detail)) = finished {
+            self.about_audio.take();
+            if !success {
+                self.last_output = format!("Falha no áudio da seção Sobre: {detail}");
+                diagnostics::event(
+                    "about_audio_error",
+                    "Player do Windows encerrou com erro",
+                    serde_json::json!({"detail": detail}),
+                );
+            } else {
+                diagnostics::event(
+                    "about_audio",
+                    "Reprodução concluída",
+                    serde_json::json!({}),
+                );
+            }
         }
     }
 }
@@ -2295,24 +2377,150 @@ impl eframe::App for FaxinaApp {
 
 
 struct AboutAudio {
-    _stream: rodio::OutputStream,
-    sink: rodio::Sink,
+    child: std::process::Child,
+    control_path: PathBuf,
+    status_path: PathBuf,
+    paused: bool,
+}
+
+impl AboutAudio {
+    fn write_command(&self, command: &str) -> Result<(), String> {
+        fs::write(&self.control_path, command.as_bytes())
+            .map_err(|error| format!("Falha ao controlar áudio: {error}"))
+    }
+
+    fn pause(&mut self) -> Result<(), String> {
+        self.write_command("pause")?;
+        self.paused = true;
+        Ok(())
+    }
+
+    fn play(&mut self) -> Result<(), String> {
+        self.write_command("play")?;
+        self.paused = false;
+        Ok(())
+    }
+
+    fn set_volume(&self, volume: f32) -> Result<(), String> {
+        self.write_command(&format!("volume={:.4}", volume.clamp(0.0, 1.0)))
+    }
+
+    fn poll_finished(&mut self) -> Option<(bool, String)> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                let detail = fs::read_to_string(&self.status_path)
+                    .unwrap_or_else(|_| format!("Processo finalizado com {status}"));
+                Some((status.success(), detail.trim().to_string()))
+            }
+            Ok(None) => None,
+            Err(error) => Some((false, format!("Falha ao consultar player: {error}"))),
+        }
+    }
+}
+
+impl Drop for AboutAudio {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.control_path, b"stop");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.control_path);
+    }
 }
 
 fn start_about_audio(path: &Path, volume: f32) -> Result<AboutAudio, String> {
-    let file = fs::File::open(path)
-        .map_err(|error| format!("Falha ao abrir áudio da seção Sobre: {error}"))?;
-    let (stream, handle) = rodio::OutputStream::try_default()
-        .map_err(|error| format!("Falha ao iniciar saída de áudio: {error}"))?;
-    let sink = rodio::Sink::try_new(&handle)
-        .map_err(|error| format!("Falha ao criar player de áudio: {error}"))?;
-    let source = rodio::Decoder::new(BufReader::new(file))
-        .map_err(|error| format!("Falha ao decodificar áudio MP4: {error}"))?;
-    sink.set_volume(volume.clamp(0.0, 1.0));
-    sink.append(source);
+    if !path.is_file() {
+        return Err(format!("Arquivo de áudio não encontrado: {}", path.display()));
+    }
+
+    let control_dir = portable_root().join("logs").join("about-audio");
+    fs::create_dir_all(&control_dir)
+        .map_err(|error| format!("Falha ao preparar controle de áudio: {error}"))?;
+    let control_path = control_dir.join("control.txt");
+    let status_path = diagnostics::session_dir()
+        .unwrap_or_else(|| control_dir.clone())
+        .join("about-audio-status.txt");
+    let _ = fs::remove_file(&control_path);
+    let _ = fs::remove_file(&status_path);
+    fs::write(&control_path, b"play")
+        .map_err(|error| format!("Falha ao criar controle de áudio: {error}"))?;
+
+    let media = path.to_string_lossy().replace('\'', "''");
+    let control = control_path.to_string_lossy().replace('\'', "''");
+    let status = status_path.to_string_lossy().replace('\'', "''");
+    let volume = volume.clamp(0.0, 1.0);
+
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'
+$mediaPath='{media}'
+$controlPath='{control}'
+$statusPath='{status}'
+try {{
+  Add-Type -AssemblyName PresentationCore
+  $player = New-Object System.Windows.Media.MediaPlayer
+  $player.Open([Uri]::new($mediaPath))
+  $player.Volume = [double]::Parse('{volume:.4}', [Globalization.CultureInfo]::InvariantCulture)
+  $player.Play()
+  Set-Content -LiteralPath $statusPath -Value 'playing' -Encoding UTF8
+  $last=''
+  while($true) {{
+    if(Test-Path -LiteralPath $controlPath) {{
+      $cmd=(Get-Content -LiteralPath $controlPath -Raw -ErrorAction SilentlyContinue).Trim()
+      if($cmd -and $cmd -ne $last) {{
+        if($cmd -eq 'pause') {{
+          $player.Pause()
+          Set-Content -LiteralPath $statusPath -Value 'paused' -Encoding UTF8
+        }} elseif($cmd -eq 'play') {{
+          $player.Play()
+          Set-Content -LiteralPath $statusPath -Value 'playing' -Encoding UTF8
+        }} elseif($cmd -eq 'stop') {{
+          break
+        }} elseif($cmd.StartsWith('volume=')) {{
+          $raw=$cmd.Substring(7)
+          $player.Volume=[double]::Parse($raw,[Globalization.CultureInfo]::InvariantCulture)
+        }}
+        $last=$cmd
+      }}
+    }}
+    if($player.NaturalDuration.HasTimeSpan -and $player.Position -ge $player.NaturalDuration.TimeSpan) {{
+      break
+    }}
+    Start-Sleep -Milliseconds 120
+  }}
+  $player.Stop()
+  $player.Close()
+  Set-Content -LiteralPath $statusPath -Value 'finished' -Encoding UTF8
+  exit 0
+}} catch {{
+  Set-Content -LiteralPath $statusPath -Value ('error=' + $_.Exception.ToString()) -Encoding UTF8
+  exit 1
+}}"#
+    );
+
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-STA",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Falha ao iniciar player do Windows: {error}"))?;
+
     Ok(AboutAudio {
-        _stream: stream,
-        sink,
+        child,
+        control_path,
+        status_path,
+        paused: false,
     })
 }
 
