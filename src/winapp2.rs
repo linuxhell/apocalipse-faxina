@@ -1,8 +1,11 @@
+use glob::{glob_with, MatchOptions, Pattern};
 use std::{
     collections::HashSet,
+    env,
     fs,
     path::{Path, PathBuf},
 };
+use walkdir::WalkDir;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuleKind {
@@ -64,11 +67,22 @@ impl WinappRule {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct WinappAnalysis {
+    pub rule_name: String,
+    pub file_count: usize,
+    pub size: u64,
+    pub files: Vec<PathBuf>,
+    pub checked: bool,
+}
+
 pub struct Winapp2State {
     pub path: PathBuf,
     pub rules: Vec<WinappRule>,
     pub status: String,
     pub filter: String,
+    pub analysis: Vec<WinappAnalysis>,
+    pub analysis_status: String,
 }
 
 impl Winapp2State {
@@ -84,6 +98,8 @@ impl Winapp2State {
             rules: Vec::new(),
             status: "Winapp2.ini ainda não carregado".into(),
             filter: String::new(),
+            analysis: Vec::new(),
+            analysis_status: String::new(),
         };
         state.reload(config_dir);
         state
@@ -100,6 +116,8 @@ impl Winapp2State {
 
     pub fn reload(&mut self, config_dir: &Path) {
         self.rules.clear();
+        self.analysis.clear();
+        self.analysis_status.clear();
         match fs::read_to_string(&self.path) {
             Ok(content) => {
                 let selected = load_selection(config_dir);
@@ -174,6 +192,135 @@ impl Winapp2State {
         }
     }
 
+
+    pub fn analyze_selected(&mut self, global_exclusions: &[String]) {
+        self.analysis.clear();
+        let mut total_files = 0usize;
+        let mut total_size = 0u64;
+        let mut skipped_registry = 0usize;
+        let mut truncated = false;
+        let mut globally_seen = HashSet::new();
+
+        for rule in self.rules.iter().filter(|rule| rule.checked) {
+            skipped_registry = skipped_registry.saturating_add(rule.reg_keys.len());
+            let mut files = Vec::new();
+            let mut size = 0u64;
+
+            for file_key in &rule.file_keys {
+                if total_files >= 250_000 {
+                    truncated = true;
+                    break;
+                }
+                for path in resolve_file_key(file_key, rule, global_exclusions) {
+                    if total_files >= 250_000 {
+                        truncated = true;
+                        break;
+                    }
+                    let normalized = normalize_path(&path.to_string_lossy());
+                    if !globally_seen.insert(normalized) {
+                        continue;
+                    }
+                    let Ok(meta) = fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+                    if !meta.is_file() || meta.file_type().is_symlink() {
+                        continue;
+                    }
+                    size = size.saturating_add(meta.len());
+                    total_size = total_size.saturating_add(meta.len());
+                    total_files += 1;
+                    files.push(path);
+                }
+            }
+
+            if !files.is_empty() {
+                self.analysis.push(WinappAnalysis {
+                    rule_name: rule.name.clone(),
+                    file_count: files.len(),
+                    size,
+                    files,
+                    checked: true,
+                });
+            }
+
+            if truncated {
+                break;
+            }
+        }
+
+        self.analysis.sort_by(|a, b| {
+            b.size
+                .cmp(&a.size)
+                .then_with(|| a.rule_name.cmp(&b.rule_name))
+        });
+
+        self.analysis_status = format!(
+            "{} regras com arquivos • {} arquivos • {}{} • {} ações de Registro ignoradas pelo modo seguro",
+            self.analysis.len(),
+            total_files,
+            fmt_bytes(total_size),
+            if truncated { " (limite de análise atingido)" } else { "" },
+            skipped_registry
+        );
+    }
+
+    pub fn clean_analyzed(&mut self, global_exclusions: &[String]) -> u64 {
+        let mut removed = 0u64;
+        let selected_rules: HashSet<String> = self
+            .analysis
+            .iter()
+            .filter(|group| group.checked)
+            .map(|group| group.rule_name.clone())
+            .collect();
+
+        let rules_by_name: std::collections::HashMap<&str, &WinappRule> = self
+            .rules
+            .iter()
+            .map(|rule| (rule.name.as_str(), rule))
+            .collect();
+
+        for group in &mut self.analysis {
+            if !selected_rules.contains(&group.rule_name) {
+                continue;
+            }
+            let Some(rule) = rules_by_name.get(group.rule_name.as_str()).copied() else {
+                continue;
+            };
+            for path in &group.files {
+                if is_excluded(path, global_exclusions) || is_rule_excluded(path, rule) {
+                    continue;
+                }
+                let before = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                if fs::remove_file(path).is_ok() {
+                    removed = removed.saturating_add(before);
+                }
+            }
+            group.files.retain(|path| path.exists());
+            group.file_count = group.files.len();
+            group.size = group
+                .files
+                .iter()
+                .filter_map(|path| fs::metadata(path).ok().map(|m| m.len()))
+                .sum();
+        }
+
+        self.analysis.retain(|group| !group.files.is_empty());
+        self.analysis_status = format!(
+            "Limpeza Winapp2 concluída • {} liberados • {} grupos ainda possuem arquivos. RegKey não foi executado.",
+            fmt_bytes(removed),
+            self.analysis.len()
+        );
+        removed
+    }
+
+    pub fn analyzed_size(&self) -> u64 {
+        self.analysis
+            .iter()
+            .filter(|group| group.checked)
+            .map(|group| group.size)
+            .sum()
+    }
+
     pub fn selected_count(&self) -> usize {
         self.rules.iter().filter(|r| r.checked).count()
     }
@@ -200,6 +347,242 @@ impl Winapp2State {
             self.rules.len(),
             self.selected_count()
         );
+    }
+}
+
+
+fn resolve_file_key(
+    file_key: &str,
+    rule: &WinappRule,
+    global_exclusions: &[String],
+) -> Vec<PathBuf> {
+    let parts: Vec<&str> = file_key.split('|').map(str::trim).collect();
+    if parts.len() < 2 {
+        return Vec::new();
+    }
+
+    let base_pattern = expand_path(parts[0]);
+    if base_pattern.trim().is_empty() {
+        return Vec::new();
+    }
+    let file_patterns: Vec<Pattern> = parts[1]
+        .split(';')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| Pattern::new(p).ok())
+        .collect();
+    if file_patterns.is_empty() {
+        return Vec::new();
+    }
+
+    let flags = parts.iter().skip(2).map(|x| x.to_ascii_uppercase()).collect::<Vec<_>>();
+    let recurse = flags.iter().any(|x| x == "RECURSE" || x == "REMOVESELF");
+    let match_options = MatchOptions {
+        case_sensitive: false,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+
+    let glob_pattern = base_pattern.replace('\\', "/");
+    let mut bases = Vec::new();
+    if glob_pattern.contains('*') || glob_pattern.contains('?') || glob_pattern.contains('[') {
+        if let Ok(paths) = glob_with(&glob_pattern, match_options) {
+            for path in paths.flatten() {
+                bases.push(path);
+            }
+        }
+    } else {
+        bases.push(PathBuf::from(base_pattern));
+    }
+
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+
+    for base in bases {
+        if is_excluded(&base, global_exclusions) {
+            continue;
+        }
+
+        let Ok(meta) = fs::symlink_metadata(&base) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+
+        if meta.is_file() {
+            let name = base
+                .file_name()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if patterns_match(&file_patterns, &name, match_options)
+                && !is_rule_excluded(&base, rule)
+            {
+                let key = normalize_path(&base.to_string_lossy());
+                if seen.insert(key) {
+                    result.push(base);
+                }
+            }
+            continue;
+        }
+
+        if recurse {
+            for entry in WalkDir::new(&base).follow_links(false).into_iter().flatten() {
+                if entry.depth() == 0 || !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if is_excluded(path, global_exclusions) || is_rule_excluded(path, rule) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy();
+                if patterns_match(&file_patterns, &name, match_options) {
+                    let key = normalize_path(&path.to_string_lossy());
+                    if seen.insert(key) {
+                        result.push(path.to_path_buf());
+                    }
+                }
+            }
+        } else if let Ok(entries) = fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if !meta.is_file() || is_excluded(&path, global_exclusions) || is_rule_excluded(&path, rule) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if patterns_match(&file_patterns, &name, match_options) {
+                    let key = normalize_path(&path.to_string_lossy());
+                    if seen.insert(key) {
+                        result.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn patterns_match(patterns: &[Pattern], name: &str, options: MatchOptions) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| pattern.matches_with(name, options))
+}
+
+fn is_rule_excluded(path: &Path, rule: &WinappRule) -> bool {
+    let normalized = normalize_path(&path.to_string_lossy());
+    let file_name = path
+        .file_name()
+        .map(|x| x.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let options = MatchOptions {
+        case_sensitive: false,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+
+    for exclude in &rule.exclude_keys {
+        let parts: Vec<&str> = exclude.split('|').map(str::trim).collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let kind = parts[0].to_ascii_uppercase();
+        if kind != "FILE" && kind != "PATH" {
+            continue;
+        }
+        let base = normalize_path(&expand_path(parts[1]));
+        if base.is_empty() {
+            continue;
+        }
+        let below = normalized == base
+            || normalized
+                .strip_prefix(&base)
+                .is_some_and(|rest| rest.starts_with('\\'));
+        if !below {
+            continue;
+        }
+        if kind == "PATH" || parts.len() < 3 {
+            return true;
+        }
+        for pattern in parts[2].split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            if Pattern::new(pattern)
+                .ok()
+                .is_some_and(|p| p.matches_with(&file_name, options))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn expand_path(input: &str) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] == '%' {
+            if let Some(end) = chars[index + 1..].iter().position(|c| *c == '%') {
+                let end = index + 1 + end;
+                let key: String = chars[index + 1..end].iter().collect();
+                let value = if key.eq_ignore_ascii_case("LocalLowAppData") {
+                    env::var("USERPROFILE")
+                        .ok()
+                        .map(|p| format!(r"{}\AppData\LocalLow", p))
+                } else {
+                    env::var(&key).ok()
+                };
+                if let Some(value) = value {
+                    result.push_str(&value);
+                } else {
+                    result.push('%');
+                    result.push_str(&key);
+                    result.push('%');
+                }
+                index = end + 1;
+                continue;
+            }
+        }
+        result.push(chars[index]);
+        index += 1;
+    }
+    result
+}
+
+fn normalize_path(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches(['\\', '/'])
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn is_excluded(path: &Path, exclusions: &[String]) -> bool {
+    let path = normalize_path(&path.to_string_lossy());
+    exclusions.iter().any(|entry| {
+        let entry = normalize_path(entry);
+        !entry.is_empty()
+            && (path == entry
+                || path
+                    .strip_prefix(&entry)
+                    .is_some_and(|rest| rest.starts_with('\\')))
+    })
+}
+
+fn fmt_bytes(value: u64) -> String {
+    const K: f64 = 1024.0;
+    let value = value as f64;
+    if value >= K * K * K {
+        format!("{:.2} GB", value / (K * K * K))
+    } else if value >= K * K {
+        format!("{:.2} MB", value / (K * K))
+    } else if value >= K {
+        format!("{:.2} KB", value / K)
+    } else {
+        format!("{} B", value as u64)
     }
 }
 

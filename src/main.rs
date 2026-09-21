@@ -657,6 +657,60 @@ impl FaxinaApp {
             }
         });
 
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    self.winapp2.selected_count() > 0,
+                    egui::Button::new("Analisar arquivos das regras marcadas"),
+                )
+                .clicked()
+            {
+                self.winapp2.analyze_selected(&self.exclusions);
+            }
+            if ui
+                .add_enabled(
+                    !self.winapp2.analysis.is_empty()
+                        && self.winapp2.analysis.iter().any(|group| group.checked),
+                    egui::Button::new("Limpar arquivos analisados"),
+                )
+                .clicked()
+            {
+                self.winapp2.clean_analyzed(&self.exclusions);
+            }
+        });
+
+        if !self.winapp2.analysis_status.is_empty() {
+            ui.label(
+                egui::RichText::new(&self.winapp2.analysis_status)
+                    .color(t.accent)
+                    .strong(),
+            );
+        }
+        if !self.winapp2.analysis.is_empty() {
+            egui::CollapsingHeader::new(format!(
+                "Resultado da análise Winapp2 • selecionado para limpeza: {}",
+                fmt_bytes(self.winapp2.analyzed_size())
+            ))
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                    for group in &mut self.winapp2.analysis {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut group.checked, "");
+                            ui.strong(&group.rule_name);
+                            ui.label(format!("{} arquivos", group.file_count));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.strong(fmt_bytes(group.size));
+                                },
+                            );
+                        });
+                    }
+                });
+            });
+        }
+
         ui.horizontal(|ui| {
             ui.label("Buscar:");
             ui.text_edit_singleline(&mut self.winapp2.filter);
