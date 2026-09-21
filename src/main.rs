@@ -2314,30 +2314,6 @@ impl FaxinaApp {
         }
     }
 
-    fn poll_about_audio(&mut self) {
-        let finished = self
-            .about_audio
-            .as_mut()
-            .and_then(|audio| audio.poll_finished());
-
-        if let Some((success, detail)) = finished {
-            self.about_audio.take();
-            if !success {
-                self.last_output = format!("Falha no áudio da seção Sobre: {detail}");
-                diagnostics::event(
-                    "about_audio_error",
-                    "Player do Windows encerrou com erro",
-                    serde_json::json!({"detail": detail}),
-                );
-            } else {
-                diagnostics::event(
-                    "about_audio",
-                    "Reprodução concluída",
-                    serde_json::json!({}),
-                );
-            }
-        }
-    }
 }
 
 impl Drop for FaxinaApp {
