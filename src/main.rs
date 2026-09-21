@@ -1,11 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod duplicates;
 mod portable_browsers;
+mod residue_scan;
 mod winapp2;
 
 use eframe::egui;
 use rodio::Source;
 use std::{
+    collections::HashMap,
     env,
     fs,
     io::BufReader,
@@ -44,6 +47,8 @@ fn main() -> eframe::Result<()> {
 enum Section {
     Painel,
     Limpeza,
+    Residuos,
+    Duplicados,
     Winapp2,
     Navegadores,
     WinSxS,
@@ -66,6 +71,8 @@ impl Section {
         &[
             (Section::Painel, "⌂", "Painel"),
             (Section::Limpeza, "✦", "Limpeza"),
+            (Section::Residuos, "R", "Resíduos profundos"),
+            (Section::Duplicados, "≡", "Arquivos duplicados"),
             (Section::Winapp2, "W", "Winapp2.ini"),
             (Section::Navegadores, "B", "Navegadores portáteis"),
             (Section::WinSxS, "▦", "WinSxS"),
@@ -145,6 +152,9 @@ struct FaxinaApp {
     exclusion_input: String,
     winapp2: winapp2::Winapp2State,
     browsers: portable_browsers::BrowserState,
+    residues: residue_scan::ResidueState,
+    duplicates: duplicates::DuplicateState,
+    duplicate_thumbnails: HashMap<String, egui::TextureHandle>,
     drive_target: String,
     driver_inf: String,
     task_name: String,
@@ -180,6 +190,9 @@ impl FaxinaApp {
             exclusion_input: String::new(),
             winapp2,
             browsers,
+            residues: residue_scan::ResidueState::default(),
+            duplicates: duplicates::DuplicateState::default(),
+            duplicate_thumbnails: HashMap::new(),
             drive_target: "C:".into(),
             driver_inf: String::new(),
             task_name: String::new(),
@@ -366,6 +379,236 @@ impl FaxinaApp {
                 ui.separator();
             }
         });
+    }
+
+
+    fn page_residues(&mut self, ui: &mut egui::Ui) {
+        let t = themes()[self.theme_index].clone();
+        ui.label("Scanner profundo por extensão, idade e localização. Arquivos de backup (.old/.bak/.backup/.bk) e logs ficam em Revisar e nunca são marcados automaticamente.");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Pasta/unidade:");
+            ui.text_edit_singleline(&mut self.residues.root);
+            if ui.button("Escolher pasta").clicked() {
+                if let Some(path) = pick_folder_dialog() {
+                    self.residues.root = path.to_string_lossy().to_string();
+                }
+            }
+            ui.label("Idade mínima:");
+            ui.add(egui::Slider::new(&mut self.residues.min_age_days, 0..=365).suffix(" dias"));
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Analisar resíduos").clicked() {
+                self.residues.analyze(&self.exclusions);
+            }
+            if ui.button("Marcar somente seguros").clicked() {
+                self.residues.mark_safe();
+            }
+            if ui.button("Desmarcar tudo").clicked() {
+                self.residues.clear();
+            }
+            if ui
+                .add_enabled(
+                    self.residues.items.iter().any(|x| x.checked),
+                    egui::Button::new("Apagar selecionados"),
+                )
+                .clicked()
+            {
+                self.residues.delete_selected(&self.exclusions);
+            }
+        });
+        ui.label(&self.residues.status);
+        ui.label(
+            egui::RichText::new(format!(
+                "Selecionado: {}",
+                fmt_bytes(self.residues.selected_size())
+            ))
+            .strong()
+            .color(t.accent),
+        );
+        ui.separator();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for item in &mut self.residues.items {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut item.checked, "");
+                    ui.vertical(|ui| {
+                        ui.strong(
+                            item.path
+                                .file_name()
+                                .map(|x| x.to_string_lossy().to_string())
+                                .unwrap_or_else(|| item.path.display().to_string()),
+                        );
+                        ui.small(item.path.display().to_string());
+                        ui.small(
+                            egui::RichText::new(format!(
+                                "{} • {} dias • {}",
+                                item.risk.label(),
+                                item.age_days,
+                                item.reason
+                            ))
+                            .color(if item.risk == residue_scan::ResidueRisk::Safe {
+                                t.accent
+                            } else {
+                                t.muted
+                            }),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.strong(fmt_bytes(item.size));
+                    });
+                });
+                ui.separator();
+            }
+        });
+    }
+
+    fn refresh_duplicate_thumbnails(&mut self, ctx: &egui::Context) {
+        self.duplicate_thumbnails.clear();
+        for file in self
+            .duplicates
+            .groups
+            .iter()
+            .flat_map(|group| group.files.iter())
+        {
+            let Some(path) = &file.thumbnail_path else {
+                continue;
+            };
+            let key = file.path.to_string_lossy().to_string();
+            if let Some(texture) = load_texture(ctx, path, &format!("duplicate-{key}")) {
+                self.duplicate_thumbnails.insert(key, texture);
+            }
+        }
+    }
+
+    fn page_duplicates(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let t = themes()[self.theme_index].clone();
+        ui.label("Duplicados reais: primeiro agrupa por tamanho, depois confirma byte a byte por SHA-256. Hardlinks para o mesmo arquivo físico são ignorados.");
+        ui.small("Nenhuma cópia é marcada para exclusão automaticamente. O Faxina também impede apagar todas as cópias de um mesmo grupo.");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Pasta/unidade:");
+            ui.text_edit_singleline(&mut self.duplicates.root);
+            if ui.button("Escolher pasta").clicked() {
+                if let Some(path) = pick_folder_dialog() {
+                    self.duplicates.root = path.to_string_lossy().to_string();
+                }
+            }
+        });
+
+        let mut analyzed = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Procurar duplicados").clicked() {
+                self.duplicates
+                    .analyze(&self.exclusions, &portable_root(), &config_dir());
+                analyzed = true;
+            }
+            if ui.button("Desmarcar tudo").clicked() {
+                self.duplicates.clear_selection();
+            }
+            if ui
+                .add_enabled(
+                    self.duplicates
+                        .groups
+                        .iter()
+                        .flat_map(|g| &g.files)
+                        .any(|f| f.checked),
+                    egui::Button::new("Apagar cópias marcadas"),
+                )
+                .clicked()
+            {
+                self.duplicates.delete_selected(&self.exclusions);
+            }
+        });
+        if analyzed {
+            self.refresh_duplicate_thumbnails(ctx);
+        }
+
+        ui.label(&self.duplicates.status);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Recuperável mantendo uma cópia: {}",
+                    fmt_bytes(self.duplicates.recoverable_size())
+                ))
+                .strong()
+                .color(t.accent),
+            );
+            ui.label(format!(
+                "Marcado para apagar: {}",
+                fmt_bytes(self.duplicates.selected_size())
+            ));
+        });
+        ui.separator();
+
+        let thumbnails = &self.duplicate_thumbnails;
+        let mut open_file: Option<PathBuf> = None;
+        let mut open_folder: Option<PathBuf> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (group_index, group) in self.duplicates.groups.iter_mut().enumerate() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("Grupo {}", group_index + 1));
+                        ui.label(format!(
+                            "{} arquivos • {} cada",
+                            group.files.len(),
+                            fmt_bytes(group.files.first().map(|x| x.size).unwrap_or(0))
+                        ));
+                        ui.label(
+                            egui::RichText::new(format!("SHA-256 {}…", &group.hash[..12.min(group.hash.len())]))
+                                .color(t.muted),
+                        );
+                    });
+                    for file in &mut group.files {
+                        ui.horizontal(|ui| {
+                            if file.is_video {
+                                let key = file.path.to_string_lossy().to_string();
+                                if let Some(texture) = thumbnails.get(&key) {
+                                    ui.add(egui::Image::new((
+                                        texture.id(),
+                                        egui::vec2(128.0, 72.0),
+                                    )));
+                                } else {
+                                    ui.allocate_ui(egui::vec2(128.0, 72.0), |ui| {
+                                        ui.centered_and_justified(|ui| {
+                                            ui.small("Vídeo\nsem thumbnail");
+                                        });
+                                    });
+                                }
+                            }
+                            ui.checkbox(&mut file.checked, "");
+                            ui.vertical(|ui| {
+                                ui.strong(
+                                    file.path
+                                        .file_name()
+                                        .map(|x| x.to_string_lossy().to_string())
+                                        .unwrap_or_default(),
+                                );
+                                ui.small(file.path.display().to_string());
+                                ui.small(if file.is_video {
+                                    "Vídeo • conteúdo confirmado por hash"
+                                } else {
+                                    "Conteúdo confirmado por hash"
+                                });
+                            });
+                            if ui.button("Abrir").clicked() {
+                                open_file = Some(file.path.clone());
+                            }
+                            if ui.button("Pasta").clicked() {
+                                open_folder = Some(file.path.clone());
+                            }
+                        });
+                        ui.separator();
+                    }
+                });
+                ui.add_space(8.0);
+            }
+        });
+
+        if let Some(path) = open_file {
+            open_default(&path);
+        }
+        if let Some(path) = open_folder {
+            open_in_folder(&path);
+        }
     }
 
     fn page_winapp2(&mut self, ui: &mut egui::Ui) {
@@ -1033,6 +1276,8 @@ impl eframe::App for FaxinaApp {
             match self.section {
                 Section::Painel => self.page_dashboard(ui),
                 Section::Limpeza => self.page_clean(ui),
+                Section::Residuos => self.page_residues(ui),
+                Section::Duplicados => self.page_duplicates(ui, ctx),
                 Section::Winapp2 => self.page_winapp2(ui),
                 Section::Navegadores => self.page_browsers(ui),
                 Section::WinSxS => self.page_winsxs(ui),
@@ -1141,6 +1386,22 @@ fn save_file_dialog(file_name: &str, filter: &str) -> Option<PathBuf> {
 fn pick_folder_dialog() -> Option<PathBuf> {
     let script = "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.FolderBrowserDialog; if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Write($d.SelectedPath)}";
     run_picker_script(script)
+}
+
+
+fn open_default(path: &Path) {
+    let quoted = path.to_string_lossy().replace('\'', "''");
+    let script = format!("Start-Process -LiteralPath '{}'", quoted);
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-Command", &script]);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let _ = command.spawn();
+}
+
+fn open_in_folder(path: &Path) {
+    let argument = format!("/select,{}", path.display());
+    let _ = Command::new("explorer.exe").arg(argument).spawn();
 }
 
 fn metric(ui: &mut egui::Ui, title: &str, value: String, accent: egui::Color32) {
