@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod development;
 mod duplicates;
 mod portable_browsers;
 mod residue_scan;
 mod startup;
 mod winapp2;
 mod windows_inventory;
+mod winsxs;
 
 use eframe::egui;
 use rodio::Source;
@@ -53,6 +55,7 @@ enum Section {
     Duplicados,
     Winapp2,
     Navegadores,
+    Desenvolvimento,
     WinSxS,
     Discos,
     Drivers,
@@ -77,6 +80,7 @@ impl Section {
             (Section::Duplicados, "≡", "Arquivos duplicados"),
             (Section::Winapp2, "W", "Winapp2.ini"),
             (Section::Navegadores, "B", "Navegadores portáteis"),
+            (Section::Desenvolvimento, "P", "Python / Desenvolvimento"),
             (Section::WinSxS, "▦", "WinSxS"),
             (Section::Discos, "◉", "Discos / SSD"),
             (Section::Drivers, "D", "Drivers"),
@@ -157,6 +161,8 @@ struct FaxinaApp {
     residues: residue_scan::ResidueState,
     duplicates: duplicates::DuplicateState,
     duplicate_thumbnails: HashMap<String, egui::TextureHandle>,
+    development: development::DevelopmentState,
+    winsxs: winsxs::WinSxsState,
     drive_target: String,
     driver_inf: String,
     inventory: windows_inventory::WindowsInventory,
@@ -196,6 +202,8 @@ impl FaxinaApp {
             residues: residue_scan::ResidueState::default(),
             duplicates: duplicates::DuplicateState::default(),
             duplicate_thumbnails: HashMap::new(),
+            development: development::DevelopmentState::default(),
+            winsxs: winsxs::WinSxsState::default(),
             drive_target: "C:".into(),
             driver_inf: String::new(),
             inventory: windows_inventory::WindowsInventory::default(),
@@ -840,16 +848,47 @@ impl FaxinaApp {
         output_box(ui, &self.last_output);
     }
 
+
+    fn page_development(&mut self, ui: &mut egui::Ui) {
+        let t = themes()[self.theme_index].clone();
+        ui.label("Python e ferramentas de desenvolvimento/IA — limpeza de caches regeneráveis sem apagar projetos, ambientes virtuais ou modelos.");
+        ui.small("As ações abaixo preferem os comandos oficiais das próprias ferramentas. __pycache__/.pyc e outros resíduos também entram no scanner profundo quando encontrados.");
+
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Diagnosticar Python / caches").clicked() {
+                self.development.diagnose();
+            }
+            if ui.button("Limpar cache do pip").clicked() {
+                self.development.clean_pip();
+            }
+            if ui.button("Limpar cache do uv").clicked() {
+                self.development.clean_uv();
+            }
+            if ui.button("Limpar caches do Poetry").clicked() {
+                self.development.clean_poetry();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Analisar limpeza Conda").clicked() {
+                self.development.analyze_conda();
+            }
+            if ui.button("Limpar caches Conda").clicked() {
+                self.development.clean_conda();
+            }
+        });
+
+        if !self.development.status.is_empty() {
+            ui.label(egui::RichText::new(&self.development.status).color(t.accent));
+        }
+        output_box(ui, &self.development.output);
+    }
+
     fn page_winsxs(&mut self, ui: &mut egui::Ui) {
+        let t = themes()[self.theme_index].clone();
         ui.label("O WinSxS é tratado somente por DISM/CBS. Nunca apagamos arquivos diretamente da pasta do Component Store.");
-        ui.small("A análise oficial do DISM informa o tamanho reportado do Component Store, componentes compartilhados, backups/cache e se a limpeza é recomendada.");
         ui.horizontal_wrapped(|ui| {
             if ui.button("Analisar tamanho e recuperável").clicked() {
-                self.capture(
-                    "Analisando WinSxS",
-                    "dism.exe",
-                    &["/Online", "/Cleanup-Image", "/AnalyzeComponentStore"],
-                );
+                self.winsxs.analyze();
             }
             if ui.button("Limpar Component Store").clicked() {
                 self.elevated_cmd(
@@ -864,8 +903,43 @@ impl FaxinaApp {
                 );
             }
         });
-        ui.small("O valor recuperável antes da operação é uma estimativa do Windows; o espaço efetivamente liberado depende de hardlinks e do estado dos componentes.");
-        output_box(ui, &self.last_output);
+
+        if !self.winsxs.status.is_empty() {
+            ui.label(egui::RichText::new(&self.winsxs.status).color(t.accent));
+        }
+
+        if self.winsxs.has_summary() {
+            egui::Grid::new("winsxs_summary")
+                .num_columns(2)
+                .spacing([18.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Tamanho reportado pelo Explorer");
+                    ui.strong(&self.winsxs.explorer_size);
+                    ui.end_row();
+                    ui.label("Tamanho real do Component Store");
+                    ui.strong(&self.winsxs.actual_size);
+                    ui.end_row();
+                    ui.label("Compartilhado com o Windows");
+                    ui.label(&self.winsxs.shared_size);
+                    ui.end_row();
+                    ui.label("Backups / recursos desativados");
+                    ui.label(&self.winsxs.backups_size);
+                    ui.end_row();
+                    ui.label("Cache / dados temporários");
+                    ui.label(&self.winsxs.cache_size);
+                    ui.end_row();
+                    ui.label("Pacotes recuperáveis");
+                    ui.strong(&self.winsxs.reclaimable_packages);
+                    ui.end_row();
+                    ui.label("Windows recomenda limpeza");
+                    ui.strong(&self.winsxs.recommended);
+                    ui.end_row();
+                });
+            ui.add_space(8.0);
+        }
+
+        ui.small("Backups/cache e pacotes recuperáveis indicam o potencial de limpeza, mas não são promessa de bytes exatos por causa de hardlinks e dependências do Component Store. Analise novamente depois da limpeza para comparar.");
+        output_box(ui, &self.winsxs.raw);
     }
 
     fn page_drivers(&mut self, ui: &mut egui::Ui) {
@@ -1510,6 +1584,7 @@ impl eframe::App for FaxinaApp {
                 Section::Duplicados => self.page_duplicates(ui, ctx),
                 Section::Winapp2 => self.page_winapp2(ui),
                 Section::Navegadores => self.page_browsers(ui),
+                Section::Desenvolvimento => self.page_development(ui),
                 Section::WinSxS => self.page_winsxs(ui),
                 Section::Discos => self.page_disks(ui),
                 Section::Drivers => self.page_drivers(ui),

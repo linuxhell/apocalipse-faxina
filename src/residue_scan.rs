@@ -27,6 +27,7 @@ pub struct ResidueItem {
     pub risk: ResidueRisk,
     pub reason: String,
     pub checked: bool,
+    pub is_dir: bool,
 }
 
 pub struct ResidueState {
@@ -107,7 +108,15 @@ impl ResidueState {
             if !item.checked || is_excluded(&item.path, exclusions) {
                 continue;
             }
-            if fs::remove_file(&item.path).is_ok() {
+            if item.is_dir {
+                let before = dir_size(&item.path, exclusions);
+                clean_directory_contents(&item.path, exclusions);
+                let after = dir_size(&item.path, exclusions);
+                removed = removed.saturating_add(before.saturating_sub(after));
+                if after == 0 {
+                    let _ = fs::remove_dir(&item.path);
+                }
+            } else if fs::remove_file(&item.path).is_ok() {
                 removed = removed.saturating_add(item.size);
             }
         }
@@ -148,6 +157,28 @@ fn scan_dir(
             continue;
         }
         if meta.is_dir() {
+            let age_days = meta
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .unwrap_or(Duration::ZERO)
+                .as_secs()
+                / 86_400;
+            if age_days >= min_age_days && is_python_cache_dir(&path) {
+                let size = dir_size(&path, exclusions);
+                if size > 0 {
+                    out.push(ResidueItem {
+                        path,
+                        size,
+                        age_days,
+                        risk: ResidueRisk::Safe,
+                        reason: "Cache regenerável de Python/ferramenta de desenvolvimento".into(),
+                        checked: false,
+                        is_dir: true,
+                    });
+                }
+                continue;
+            }
             scan_dir(
                 &path,
                 exclusions,
@@ -182,6 +213,7 @@ fn scan_dir(
                 risk,
                 reason,
                 checked: false,
+                is_dir: false,
             });
         }
     }
@@ -193,7 +225,7 @@ fn classify_file(path: &Path) -> Option<(ResidueRisk, String)> {
         .map(|x| x.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
 
-    let safe = ["tmp", "temp", "chk", "dmp", "mdmp", "wer", "crdownload", "part", "download"];
+    let safe = ["tmp", "temp", "chk", "dmp", "mdmp", "wer", "crdownload", "part", "download", "pyc", "pyo"];
     if safe.contains(&ext.as_str()) {
         return Some((
             ResidueRisk::Safe,
@@ -210,6 +242,71 @@ fn classify_file(path: &Path) -> Option<(ResidueRisk, String)> {
     }
 
     None
+}
+
+fn is_python_cache_dir(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|x| x.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        name.as_str(),
+        "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache"
+    )
+}
+
+fn dir_size(path: &Path, exclusions: &[String]) -> u64 {
+    if is_excluded(path, exclusions) {
+        return 0;
+    }
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.file_type().is_symlink() {
+        return 0;
+    }
+    if meta.is_file() {
+        return meta.len();
+    }
+    let mut total = 0u64;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            total = total.saturating_add(dir_size(&entry.path(), exclusions));
+        }
+    }
+    total
+}
+
+fn clean_directory_contents(path: &Path, exclusions: &[String]) {
+    if is_excluded(path, exclusions) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if is_excluded(&child, exclusions) {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(&child) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            clean_directory_contents(&child, exclusions);
+            let empty = fs::read_dir(&child)
+                .map(|mut it| it.next().is_none())
+                .unwrap_or(false);
+            if empty {
+                let _ = fs::remove_dir(&child);
+            }
+        } else {
+            let _ = fs::remove_file(&child);
+        }
+    }
 }
 
 fn should_skip_directory(path: &Path) -> bool {
