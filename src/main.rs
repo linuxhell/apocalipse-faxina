@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod defrag;
 mod development;
 mod drivers;
 mod duplicates;
@@ -166,6 +167,7 @@ struct FaxinaApp {
     development: development::DevelopmentState,
     winsxs: winsxs::WinSxsState,
     drive_target: String,
+    defrag: defrag::DefragState,
     drivers: drivers::DriverState,
     inventory: windows_inventory::WindowsInventory,
     startup: startup::StartupState,
@@ -209,6 +211,7 @@ impl FaxinaApp {
             development: development::DevelopmentState::default(),
             winsxs: winsxs::WinSxsState::default(),
             drive_target: "C:".into(),
+            defrag: defrag::DefragState::default(),
             drivers: drivers::DriverState::default(),
             inventory: windows_inventory::WindowsInventory::default(),
             startup: startup::StartupState::default(),
@@ -920,7 +923,15 @@ impl FaxinaApp {
     }
 
     fn page_disks(&mut self, ui: &mut egui::Ui) {
-        ui.label("Otimização consciente do tipo de unidade: o modo recomendado usa o mecanismo do Windows para escolher a operação correta conforme HDD/SSD/NVMe.");
+        self.defrag.poll();
+        if self.defrag.running {
+            ui.ctx().request_repaint_after(defrag::sleep_repaint_hint());
+        }
+
+        let t = themes()[self.theme_index].clone();
+        ui.label("Otimização por tipo de mídia com análise antes/depois, progresso e mapa proporcional de ocupação/fragmentação.");
+        ui.small("O Faxina usa o mecanismo nativo do Windows. O mapa preserva proporções reais de espaço usado/livre e fragmentação, mas não representa a posição física exata de cada cluster.");
+
         ui.horizontal_wrapped(|ui| {
             if ui.button("Detectar unidades").clicked() {
                 self.capture(
@@ -934,37 +945,179 @@ impl FaxinaApp {
                 );
             }
             ui.label("Unidade:");
-            ui.text_edit_singleline(&mut self.drive_target);
+            ui.add_enabled(
+                !self.defrag.running,
+                egui::TextEdit::singleline(&mut self.drive_target).desired_width(70.0),
+            );
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_label("Modo")
+                .selected_text(self.defrag.selected_mode().label())
+                .show_ui(ui, |ui| {
+                    for (index, mode) in defrag::OptimizationMode::ALL.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut self.defrag.selected_mode,
+                            index,
+                            mode.label(),
+                        );
+                    }
+                });
+            ui.label(
+                egui::RichText::new(self.defrag.selected_mode().description())
+                    .color(t.muted),
+            );
         });
 
         let target = normalize_drive_target(&self.drive_target);
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(target.is_some(), egui::Button::new("Analisar fragmentação/otimização")).clicked() {
+            if ui
+                .add_enabled(
+                    target.is_some() && !self.defrag.running,
+                    egui::Button::new("Analisar unidade"),
+                )
+                .clicked()
+            {
                 if let Some(drive) = target.clone() {
-                    self.capture("Analisando unidade", "defrag.exe", &[&drive, "/A", "/V"]);
+                    self.defrag.analyze(drive);
                 }
             }
-            if ui.add_enabled(target.is_some(), egui::Button::new("Otimizar recomendado (/O)")).clicked() {
+
+            if ui
+                .add_enabled(
+                    target.is_some() && !self.defrag.running,
+                    egui::Button::new("Otimizar + medir antes/depois"),
+                )
+                .clicked()
+            {
                 if let Some(drive) = target.clone() {
-                    self.elevated_cmd(
-                        "Otimização recomendada",
-                        &format!("defrag {} /O /U /V", drive),
-                    );
+                    let mode = self.defrag.selected_mode();
+                    self.defrag.optimize(drive, mode);
                 }
             }
-            if ui.add_enabled(target.is_some(), egui::Button::new("ReTRIM SSD/NVMe (/L)")).clicked() {
-                if let Some(drive) = target.clone() {
-                    self.elevated_cmd("ReTRIM", &format!("defrag {} /L /U /V", drive));
-                }
-            }
-            if ui.add_enabled(target.is_some(), egui::Button::new("Desfragmentar HDD (/D)")).clicked() {
-                if let Some(drive) = target.clone() {
-                    self.elevated_cmd("Desfragmentação HDD", &format!("defrag {} /D /U /V", drive));
-                }
+
+            if ui
+                .add_enabled(self.defrag.running, egui::Button::new("Parar"))
+                .clicked()
+            {
+                self.defrag.cancel();
             }
         });
-        ui.small("Para SSD/NVMe prefira /O ou /L. O Faxina não aplica desfragmentação tradicional agressiva automaticamente em SSD.");
-        output_box(ui, &self.last_output);
+
+        if self.defrag.running || self.defrag.progress > 0.0 {
+            ui.add(
+                egui::ProgressBar::new((self.defrag.progress / 100.0).clamp(0.0, 1.0))
+                    .show_percentage()
+                    .text(format!(
+                        "{} • {:.0}%",
+                        self.defrag.phase, self.defrag.progress
+                    )),
+            );
+        }
+        ui.label(&self.defrag.status);
+
+        if let Some(snapshot) = self.defrag.current_snapshot() {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!(
+                    "{} {}",
+                    snapshot.info.drive,
+                    if snapshot.info.label.is_empty() {
+                        ""
+                    } else {
+                        &snapshot.info.label
+                    }
+                ));
+                ui.label(format!(
+                    "{} • {} • {} • {}",
+                    snapshot.info.file_system,
+                    snapshot.info.media_type,
+                    snapshot.info.bus_type,
+                    snapshot.info.health
+                ));
+                ui.label(format!(
+                    "Livre: {} / {}",
+                    defrag::format_bytes(snapshot.info.free),
+                    defrag::format_bytes(snapshot.info.size)
+                ));
+            });
+
+            ui.add_space(8.0);
+            ui.strong("Mapa proporcional");
+            draw_fragmentation_map(ui, snapshot, t.accent);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("■ Fragmentado").color(egui::Color32::from_rgb(220, 55, 55)));
+                ui.label(egui::RichText::new("■ Alocado").color(t.accent));
+                ui.label("Espaço livre = sem bloco");
+            });
+        }
+
+        if let Some(before) = &self.defrag.before {
+            ui.separator();
+            ui.strong("Resultado real antes/depois");
+            let after = self.defrag.after.as_ref();
+
+            egui::Grid::new("disk_before_after")
+                .num_columns(3)
+                .spacing([18.0, 6.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Métrica");
+                    ui.strong("Antes");
+                    ui.strong("Depois");
+                    ui.end_row();
+
+                    ui.label("Fragmentação");
+                    ui.label(format_optional_percent(before.fragmentation_percent));
+                    ui.label(after.map(|x| format_optional_percent(x.fragmentation_percent)).unwrap_or_else(|| "—".into()));
+                    ui.end_row();
+
+                    ui.label("Arquivos fragmentados");
+                    ui.label(format_optional_u64(before.fragmented_files));
+                    ui.label(after.map(|x| format_optional_u64(x.fragmented_files)).unwrap_or_else(|| "—".into()));
+                    ui.end_row();
+
+                    ui.label("Espaço livre");
+                    ui.label(defrag::format_bytes(before.info.free));
+                    ui.label(after.map(|x| defrag::format_bytes(x.info.free)).unwrap_or_else(|| "—".into()));
+                    ui.end_row();
+
+                    ui.label("Leitura sequencial WinSAT");
+                    ui.label(before.sequential_read_mbps.map(|x| format!("{x:.1} MB/s")).unwrap_or_else(|| "indisponível".into()));
+                    ui.label(after.and_then(|x| x.sequential_read_mbps).map(|x| format!("{x:.1} MB/s")).unwrap_or_else(|| "—".into()));
+                    ui.end_row();
+
+                    ui.label("Leitura aleatória WinSAT");
+                    ui.label(before.random_read_mbps.map(|x| format!("{x:.1} MB/s")).unwrap_or_else(|| "indisponível".into()));
+                    ui.label(after.and_then(|x| x.random_read_mbps).map(|x| format!("{x:.1} MB/s")).unwrap_or_else(|| "—".into()));
+                    ui.end_row();
+                });
+
+            if let Some(after) = after {
+                ui.small(format!(
+                    "Variação medida: sequencial {} • aleatória {}",
+                    defrag::performance_delta(
+                        before.sequential_read_mbps,
+                        after.sequential_read_mbps
+                    ),
+                    defrag::performance_delta(
+                        before.random_read_mbps,
+                        after.random_read_mbps
+                    )
+                ));
+                ui.small("WinSAT mede leitura no momento do teste; diferenças pequenas podem refletir cache, temperatura, carga do sistema e características do SSD/HDD.");
+            }
+        }
+
+        if !self.defrag.output.trim().is_empty() {
+            egui::CollapsingHeader::new("Saída detalhada do Windows")
+                .show(ui, |ui| output_box(ui, &self.defrag.output));
+        }
+
+        if !self.last_output.trim().is_empty() {
+            egui::CollapsingHeader::new("Inventário de unidades")
+                .show(ui, |ui| output_box(ui, &self.last_output));
+        }
     }
 
 
@@ -2231,6 +2384,74 @@ fn timestamp_slug() -> String {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         format!("backup-{seconds}")
+    }
+}
+
+fn format_optional_percent(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "não informado".into())
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "não informado".into())
+}
+
+fn draw_fragmentation_map(
+    ui: &mut egui::Ui,
+    snapshot: &defrag::Snapshot,
+    allocated_color: egui::Color32,
+) {
+    let columns = 48usize;
+    let rows = 7usize;
+    let count = columns * rows;
+    let gap = 2.0f32;
+    let width = ui.available_width().max(240.0);
+    let cell = ((width - gap * (columns.saturating_sub(1) as f32)) / columns as f32)
+        .clamp(3.0, 13.0);
+    let height = rows as f32 * cell + gap * (rows.saturating_sub(1) as f32);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(columns as f32 * cell + gap * (columns.saturating_sub(1) as f32), height),
+        egui::Sense::hover(),
+    );
+
+    let used_ratio = if snapshot.info.size > 0 {
+        1.0 - (snapshot.info.free as f64 / snapshot.info.size as f64)
+    } else {
+        0.0
+    }
+    .clamp(0.0, 1.0);
+    let used_cells = ((count as f64 * used_ratio).round() as usize).min(count);
+    let frag_ratio = snapshot
+        .fragmentation_percent
+        .unwrap_or(0.0)
+        .clamp(0.0, 100.0) as f64
+        / 100.0;
+    let fragmented_cells =
+        ((used_cells as f64 * frag_ratio).round() as usize).min(used_cells);
+
+    for index in 0..used_cells {
+        let row = index / columns;
+        let col = index % columns;
+        let min = egui::pos2(
+            rect.min.x + col as f32 * (cell + gap),
+            rect.min.y + row as f32 * (cell + gap),
+        );
+        let cell_rect = egui::Rect::from_min_size(min, egui::vec2(cell, cell));
+
+        // Espalha os blocos fragmentados proporcionalmente pelo espaço usado
+        // para evitar sugerir uma posição física que o defrag.exe não informa.
+        let red = fragmented_cells > 0
+            && ((index.wrapping_mul(97).wrapping_add(31)) % used_cells.max(1))
+                < fragmented_cells;
+        let color = if red {
+            egui::Color32::from_rgb(220, 55, 55)
+        } else {
+            allocated_color
+        };
+        ui.painter().rect_filled(cell_rect, 1.0, color);
     }
 }
 
