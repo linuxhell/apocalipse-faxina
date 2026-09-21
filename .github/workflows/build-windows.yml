@@ -1,0 +1,44 @@
+name: Build Windows x64
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compilar release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Preparar portátil
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\apocalipse-faxina.exe dist\Apocalipse-Faxina\Apocalipse-Faxina.exe
+          New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\data | Out-Null
+          New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\config | Out-Null
+          New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\backups | Out-Null
+          New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\logs | Out-Null
+          Set-Content -Encoding UTF8 dist\Apocalipse-Faxina\data\LEIA-ME.txt "Coloque winapp2.ini nesta pasta para carregar as regras Winapp2."
+
+      - name: Artefato Windows x64 portátil
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apocalipse-Faxina-Windows-x64
+          path: dist/Apocalipse-Faxina/
+          if-no-files-found: error
