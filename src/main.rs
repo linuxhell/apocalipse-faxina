@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod defrag;
+mod diagnostics;
 mod development;
 mod drivers;
 mod duplicates;
+mod optimizer_db;
 mod portable_browsers;
 mod residue_scan;
 mod services;
@@ -35,11 +37,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 fn main() -> eframe::Result<()> {
+    diagnostics::init(&portable_root());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Apocalipse Faxina")
-            .with_inner_size([1240.0, 780.0])
-            .with_min_inner_size([980.0, 640.0]),
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([1100.0, 700.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -70,6 +73,7 @@ enum Section {
     ReparoInternet,
     Exclusoes,
     Aparencia,
+    Diagnostico,
     Sobre,
 }
 
@@ -95,6 +99,7 @@ impl Section {
             (Section::ReparoInternet, "⌁", "Reparo da Internet"),
             (Section::Exclusoes, "⊘", "Exclusões"),
             (Section::Aparencia, "◐", "Aparência"),
+            (Section::Diagnostico, "⌘", "Diagnóstico"),
             (Section::Sobre, "ⓘ", "Sobre"),
         ]
     }
@@ -736,6 +741,17 @@ impl FaxinaApp {
             );
         }
         if !self.winapp2.analysis.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "GANHO TOTAL SE LIMPAR O SELECIONADO: {}",
+                    fmt_bytes(self.winapp2.analyzed_size())
+                ))
+                .size(18.0)
+                .strong()
+                .color(t.accent),
+            );
+        }
+        if !self.winapp2.analysis.is_empty() {
             egui::CollapsingHeader::new(format!(
                 "Resultado da análise Winapp2 • selecionado para limpeza: {}",
                 fmt_bytes(self.winapp2.analyzed_size())
@@ -1215,10 +1231,20 @@ impl FaxinaApp {
     }
 
     fn page_drivers(&mut self, ui: &mut egui::Ui) {
+        self.drivers.poll();
+        if self.drivers.scanning {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        }
         let t = themes()[self.theme_index].clone();
         ui.label("Driver Store organizado por categoria. O Faxina só marca automaticamente como antigo um pacote redundante que não está em uso, não é Inbox e não é crítico de inicialização.");
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Analisar Driver Store").clicked() {
+            if ui
+                .add_enabled(
+                    !self.drivers.scanning,
+                    egui::Button::new(if self.drivers.scanning { "Analisando Driver Store…" } else { "Analisar Driver Store" }),
+                )
+                .clicked()
+            {
                 self.drivers.scan();
             }
             if ui.button("Selecionar drivers antigos").clicked() {
@@ -1406,6 +1432,9 @@ impl FaxinaApp {
             if ui.button("Atualizar lista").clicked() {
                 self.startup.scan();
             }
+            if ui.button("Marcar programas conhecidos para otimização").clicked() {
+                self.startup.mark_known_for_optimization();
+            }
             if ui.button("Marcar todos").clicked() {
                 self.startup.set_all_checked(true);
             }
@@ -1460,6 +1489,9 @@ impl FaxinaApp {
                         }
                         if !entry.command.is_empty() {
                             ui.small(egui::RichText::new(&entry.command).color(t.muted));
+                        }
+                        if let Some(reason) = &entry.optimization_reason {
+                            ui.small(egui::RichText::new(format!("Otimização: {reason}")).color(t.accent));
                         }
                     });
                 });
@@ -1609,6 +1641,11 @@ impl FaxinaApp {
             );
             if ui.button("Atualizar serviços").clicked() {
                 self.services.scan();
+            }
+            if ui.button("Marcar serviços Windows conhecidos para Manual").clicked() {
+                self.services.mark_known_windows_manual();
+                self.hide_microsoft_services = false;
+                self.service_user_only = false;
             }
             if ui.button("Desmarcar todos").clicked() {
                 self.services.clear_selection();
@@ -1776,6 +1813,12 @@ impl FaxinaApp {
                             egui::RichText::new(tags.join(" • "))
                                 .color(t.accent),
                         );
+                        if let Some(reason) = &service.optimization_reason {
+                            ui.small(egui::RichText::new(format!("Preset Manual: {reason}")).color(t.accent));
+                        }
+                        if service.has_trigger {
+                            ui.small(egui::RichText::new("Trigger: pode iniciar sob demanda").color(t.muted));
+                        }
                         if let Some(error) = &service.error {
                             ui.small(
                                 egui::RichText::new(format!("Falha: {error}"))
@@ -2049,6 +2092,34 @@ impl FaxinaApp {
         ui.small("0% = opaco. O limite de 45% evita perder legibilidade.");
     }
 
+    fn page_diagnostics(&mut self, ui: &mut egui::Ui) {
+        let t=themes()[self.theme_index].clone();
+        ui.label("Debugger estruturado do Apocalipse Faxina.");
+        ui.small("Registra sessão, cliques, mudanças de seção, travamentos da UI, operações, erros e crashes. O ZIP adiciona inventário técnico do Windows.");
+        egui::Grid::new("diagnostic_summary").num_columns(2).spacing([18.0,8.0]).show(ui,|ui|{
+            ui.label("Sessão");ui.strong(diagnostics::session_id());ui.end_row();
+            ui.label("Eventos registrados");ui.strong(diagnostics::event_count().to_string());ui.end_row();
+            ui.label("Último evento");ui.label(diagnostics::last_event());ui.end_row();
+            ui.label("Banco de otimização");ui.label(format!("{} • {} regras de inicialização • {} regras de serviços",optimizer_db::DB_VERSION,optimizer_db::startup_rule_count(),optimizer_db::service_rule_count()));ui.end_row();
+        });
+        ui.label(egui::RichText::new(optimizer_db::DB_SOURCE_NOTE).color(t.muted));
+        ui.separator();
+        ui.horizontal_wrapped(|ui|{
+            if ui.button("Exportar diagnóstico ZIP").clicked(){
+                let started=std::time::Instant::now();diagnostics::operation_start("diagnostico","export_zip",serde_json::json!({}));
+                match diagnostics::export_zip(&portable_root()){
+                    Ok(path)=>{self.last_output=format!("Diagnóstico exportado:\n{}",path.display());diagnostics::operation_end("diagnostico","export_zip",true,started.elapsed().as_millis(),serde_json::json!({"path":path.to_string_lossy()}));}
+                    Err(error)=>{self.last_output=format!("Falha ao exportar diagnóstico: {error}");diagnostics::operation_end("diagnostico","export_zip",false,started.elapsed().as_millis(),serde_json::json!({"error":error}));}
+                }
+            }
+            if ui.button("Abrir pasta de logs").clicked(){if let Some(path)=diagnostics::logs_root(){let _=Command::new("explorer.exe").arg(path).spawn();}}
+            if ui.button("Abrir pasta dos ZIPs").clicked(){let path=portable_root().join("diagnostics");let _=fs::create_dir_all(&path);let _=Command::new("explorer.exe").arg(path).spawn();}
+        });
+        if let Some(path)=diagnostics::session_dir(){ui.small(format!("Sessão atual: {}",path.display()));}
+        ui.small("Privacidade: senhas, cookies, credenciais e tokens não são coletados intencionalmente.");
+        output_box(ui,&self.last_output);
+    }
+
     fn page_about(&mut self, ui: &mut egui::Ui) {
         let t = themes()[self.theme_index].clone();
 
@@ -2156,16 +2227,20 @@ impl FaxinaApp {
 
     fn restart_about_audio(&mut self) {
         self.stop_about_audio();
-        let path = portable_root().join("assets").join("about-theme.mp4");
-        match start_about_audio(&path, self.about_volume) {
-            Ok(audio) => self.about_audio = Some(audio),
-            Err(error) => self.last_output = error,
+        let path=portable_root().join("assets").join("about-theme.mp4");
+        diagnostics::event("about_audio","Iniciando áudio da seção Sobre",serde_json::json!({"path":path.to_string_lossy()}));
+        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||start_about_audio(&path,self.about_volume)));
+        match result{
+            Ok(Ok(audio))=>{self.about_audio=Some(audio);diagnostics::event("about_audio","Áudio iniciado",serde_json::json!({}));}
+            Ok(Err(error))=>{self.last_output=error.clone();diagnostics::event("about_audio_error","Falha ao iniciar áudio",serde_json::json!({"error":error}));}
+            Err(_)=>{self.last_output="O backend de áudio falhou, mas o Faxina continuou aberto. Consulte Diagnóstico.".into();diagnostics::event("about_audio_panic","Panic contido no backend de áudio",serde_json::json!({}));}
         }
     }
 }
 
 impl eframe::App for FaxinaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_started=std::time::Instant::now();
         self.apply_theme(ctx);
         let t = themes()[self.theme_index].clone();
         let section_before_nav = self.section;
@@ -2190,6 +2265,7 @@ impl eframe::App for FaxinaApp {
         });
 
         if self.section != section_before_nav {
+            diagnostics::event("section_change","Seção alterada",serde_json::json!({"from":section_before_nav.title(),"to":self.section.title()}));
             if section_before_nav == Section::Sobre {
                 self.stop_about_audio();
             }
@@ -2220,9 +2296,13 @@ impl eframe::App for FaxinaApp {
                 Section::ReparoInternet => self.page_repair_internet(ui),
                 Section::Exclusoes => self.page_exclusions(ui),
                 Section::Aparencia => self.page_appearance(ui, ctx),
+                Section::Diagnostico => self.page_diagnostics(ui),
                 Section::Sobre => self.page_about(ui),
             }
         });
+        let click=ctx.input(|input|if input.pointer.any_click(){input.pointer.interact_pos().map(|p|(p.x,p.y,input.pointer.secondary_clicked()))}else{None});
+        if let Some((x,y,secondary))=click{diagnostics::ui_click(self.section.title(),x,y,secondary);}
+        diagnostics::frame_finished(self.section.title(),frame_started.elapsed().as_millis());
     }
 }
 
