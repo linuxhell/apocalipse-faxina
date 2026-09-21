@@ -1206,12 +1206,12 @@ impl FaxinaApp {
                     animation_time,
                 );
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("■ Fragmentado").color(egui::Color32::from_rgb(220,55,55)));
+                    ui.label(egui::RichText::new("■ Fragmentado / em processamento").color(egui::Color32::from_rgb(220,55,55)));
                     ui.label(egui::RichText::new("■ Alocado").color(t.accent));
                     ui.label("Espaço livre = sem bloco");
                 });
                 if live_map {
-                    ui.small("Durante a operação, os blocos vermelhos se deslocam e diminuem conforme o defrag.exe reporta progresso. O resultado real é confirmado pela medição final do Windows.");
+                    ui.small("Durante a operação, os blocos vermelhos são uma animação de atividade baseada na fragmentação/arquivos fragmentados medidos e no progresso reportado pelo defrag.exe. Eles se deslocam e diminuem; não representam posições físicas de clusters. O resultado real é confirmado pela medição final do Windows.");
                 } else if current.fragmentation_percent.unwrap_or(0.0) <= 0.0
                     && current.fragmented_files.unwrap_or(0) > 0
                 {
@@ -3302,37 +3302,47 @@ fn draw_fragmentation_map(
         .unwrap_or(0.0)
         .clamp(0.0, 100.0) as f64
         / 100.0;
-    let mut measured_fragmented =
+    let measured_by_percent =
         ((used_cells as f64 * frag_ratio).round() as usize).min(used_cells);
 
-    // O defrag.exe pode arredondar a fragmentação para 0,0% mesmo relatando
-    // arquivos fragmentados. Nesse caso exibimos somente um bloco vermelho
-    // mínimo para indicar a condição sem inventar uma porcentagem.
-    if measured_fragmented == 0
-        && used_cells > 0
-        && snapshot.fragmented_files.unwrap_or(0) > 0
-    {
-        measured_fragmented = 1;
-    }
+    // O Windows pode arredondar a fragmentação para 0,0% mesmo relatando
+    // centenas/milhares de arquivos fragmentados. Nesse caso usamos uma
+    // quantidade VISUAL simbólica (não percentual) para que a atividade
+    // continue perceptível sem fingir posições físicas de clusters.
+    let fragmented_files = snapshot.fragmented_files.unwrap_or(0);
+    let symbolic_by_files = if fragmented_files > 0 && used_cells > 0 {
+        let magnitude = ((fragmented_files as f64 + 1.0).log2().round() as usize)
+            .clamp(3, 12);
+        magnitude.min(used_cells)
+    } else {
+        0
+    };
+
+    let measured_fragmented = measured_by_percent.max(symbolic_by_files);
 
     let optimization_progress = if live {
-        ((live_progress - 8.0) / 74.0).clamp(0.0, 1.0)
+        ((live_progress - 8.0) / 82.0).clamp(0.0, 1.0)
     } else {
         0.0
     };
 
     let fragmented_cells = if live && measured_fragmented > 0 {
-        ((measured_fragmented as f32 * (1.0 - optimization_progress)).ceil() as usize)
-            .min(measured_fragmented)
+        let remaining =
+            ((measured_fragmented as f32 * (1.0 - optimization_progress)).ceil() as usize)
+                .min(measured_fragmented);
+        if optimization_progress < 0.96 {
+            remaining.max(1)
+        } else {
+            remaining
+        }
     } else {
         measured_fragmented
     };
 
-    // O deslocamento é puramente visual e é movido pelo relógio da UI.
-    // A quantidade de vermelho, porém, acompanha o progresso real reportado
-    // pelo defrag.exe para a unidade atual.
-    let shift = if live && used_cells > 0 && live_progress >= 8.0 && live_progress < 90.0 {
-        ((animation_time * 6.0) as usize) % used_cells
+    // Movimento contínuo independente de o defrag.exe imprimir uma nova
+    // porcentagem naquele instante. request_repaint_after() mantém a animação.
+    let tick = if live && used_cells > 0 {
+        (animation_time * 10.0) as usize
     } else {
         0
     };
@@ -3346,15 +3356,20 @@ fn draw_fragmentation_map(
         );
         let cell_rect = egui::Rect::from_min_size(min, egui::vec2(cell, cell));
 
-        let rank = if used_cells > 0 {
+        // A permutação espalha os blocos vermelhos no mapa; o deslocamento
+        // pelo relógio faz a atividade "andar" em tempo real.
+        let moving_index = if used_cells > 0 {
             index
-                .wrapping_mul(97)
-                .wrapping_add(31)
-                .wrapping_add(shift.wrapping_mul(17))
+                .wrapping_add(tick)
+                .wrapping_add((live_progress.max(0.0) as usize).wrapping_mul(3))
                 % used_cells
         } else {
             0
         };
+        let rank = moving_index
+            .wrapping_mul(97)
+            .wrapping_add(31)
+            % used_cells.max(1);
         let red = fragmented_cells > 0 && rank < fragmented_cells;
 
         let color = if red {
@@ -3363,6 +3378,17 @@ fn draw_fragmentation_map(
             allocated_color
         };
         ui.painter().rect_filled(cell_rect, 1.0, color);
+
+        // Um contorno leve identifica os blocos que estão "passando" pelo
+        // ponto de atividade, sem alterar a cor de alocação real.
+        if live && used_cells > 0 && moving_index % 23 == 0 {
+            ui.painter().rect_stroke(
+                cell_rect,
+                1.0,
+                egui::Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.55)),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
 }
 
