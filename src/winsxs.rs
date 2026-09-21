@@ -98,7 +98,7 @@ fn query_system_free()->Result<u64,String>{
     out.trim().parse::<u64>().map_err(|e|format!("Falha ao medir espaço livre: {e}"))
 }
 fn parse_size(v:&str)->Option<u64>{
-    let mut it=v.split_whitespace();let n=it.next()?.replace(',','.').parse::<f64>().ok()?;let unit=it.next().unwrap_or("bytes").to_ascii_lowercase();
+    let mut it=v.split_whitespace();let n=it.next()?.replace(',',"." ).parse::<f64>().ok()?;let unit=it.next().unwrap_or("bytes").to_ascii_lowercase();
     let mul=if unit.starts_with("gb"){1024f64.powi(3)}else if unit.starts_with("mb"){1024f64.powi(2)}else if unit.starts_with("kb"){1024.0}else{1.0};
     Some((n*mul)as u64)
 }
