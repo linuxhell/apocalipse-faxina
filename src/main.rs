@@ -171,7 +171,6 @@ struct FaxinaApp {
     duplicate_thumbnails: HashMap<String, egui::TextureHandle>,
     development: development::DevelopmentState,
     winsxs: winsxs::WinSxsState,
-    drive_target: String,
     defrag: defrag::DefragState,
     drivers: drivers::DriverState,
     inventory: windows_inventory::WindowsInventory,
@@ -196,6 +195,8 @@ impl FaxinaApp {
         let exclusions = load_exclusions();
         let winapp2 = winapp2::Winapp2State::load(&root, &cfg);
         let browsers = portable_browsers::BrowserState::load(&cfg);
+        let mut defrag = defrag::DefragState::default();
+        defrag.start_detect();
         let about_background = load_texture(&cc.egui_ctx, &root.join("assets").join("about-background.jpg"), "about-background");
         let about_creator = load_texture(&cc.egui_ctx, &root.join("assets").join("about-creator.jpg"), "about-creator");
         let mut app = Self {
@@ -215,8 +216,7 @@ impl FaxinaApp {
             duplicate_thumbnails: HashMap::new(),
             development: development::DevelopmentState::default(),
             winsxs: winsxs::WinSxsState::default(),
-            drive_target: "C:".into(),
-            defrag: defrag::DefragState::default(),
+            defrag,
             drivers: drivers::DriverState::default(),
             inventory: windows_inventory::WindowsInventory::default(),
             startup: startup::StartupState::default(),
@@ -940,31 +940,49 @@ impl FaxinaApp {
 
     fn page_disks(&mut self, ui: &mut egui::Ui) {
         self.defrag.poll();
-        if self.defrag.running {
+        if self.defrag.running || self.defrag.detecting {
             ui.ctx().request_repaint_after(defrag::sleep_repaint_hint());
         }
-
         let t = themes()[self.theme_index].clone();
-        ui.label("Otimização por tipo de mídia com análise antes/depois, progresso e mapa proporcional de ocupação/fragmentação.");
-        ui.small("O Faxina usa o mecanismo nativo do Windows. O mapa preserva proporções reais de espaço usado/livre e fragmentação, mas não representa a posição física exata de cada cluster.");
+
+        ui.label("As unidades são detectadas automaticamente. Marque uma ou várias e execute o mesmo modo de otimização; cada volume recebe relatório próprio.");
+        ui.small("O mapa é proporcional à ocupação/fragmentação informada pelo Windows; não inventa posições físicas de clusters.");
 
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Detectar unidades").clicked() {
-                self.capture(
-                    "Detectando unidades",
-                    "powershell.exe",
-                    &[
-                        "-NoProfile",
-                        "-Command",
-                        "Get-Volume | Where-Object {$_.DriveLetter} | Select DriveLetter,FileSystemLabel,FileSystem,HealthStatus,SizeRemaining,Size | Format-Table -AutoSize | Out-String -Width 240; Get-PhysicalDisk | Select FriendlyName,MediaType,BusType,HealthStatus,Size | Format-Table -AutoSize | Out-String -Width 240"
-                    ],
-                );
+            if ui.add_enabled(!self.defrag.running && !self.defrag.detecting, egui::Button::new("Detectar unidades novamente")).clicked() {
+                self.defrag.start_detect();
             }
-            ui.label("Unidade:");
-            ui.add_enabled(
-                !self.defrag.running,
-                egui::TextEdit::singleline(&mut self.drive_target).desired_width(70.0),
-            );
+            if ui.button("Marcar todas").clicked() { self.defrag.select_all(true); }
+            if ui.button("Desmarcar todas").clicked() { self.defrag.select_all(false); }
+            ui.label(format!("{} selecionada(s)", self.defrag.selected_count()));
+        });
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            if self.defrag.detecting {
+                ui.spinner();
+                ui.label("Detectando volumes e tipo de mídia…");
+            }
+            for volume in &mut self.defrag.volumes {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut volume.checked, "");
+                    ui.strong(&volume.info.drive);
+                    if !volume.info.label.is_empty() { ui.label(&volume.info.label); }
+                    ui.label(format!(
+                        "{} • {} • {} • {}",
+                        volume.info.file_system,
+                        volume.info.media_type,
+                        volume.info.bus_type,
+                        volume.info.health
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(format!(
+                            "Livre {} / {}",
+                            defrag::format_bytes(volume.info.free),
+                            defrag::format_bytes(volume.info.size)
+                        ));
+                    });
+                });
+            }
         });
 
         ui.horizontal_wrapped(|ui| {
@@ -972,50 +990,21 @@ impl FaxinaApp {
                 .selected_text(self.defrag.selected_mode().label())
                 .show_ui(ui, |ui| {
                     for (index, mode) in defrag::OptimizationMode::ALL.iter().enumerate() {
-                        ui.selectable_value(
-                            &mut self.defrag.selected_mode,
-                            index,
-                            mode.label(),
-                        );
+                        ui.selectable_value(&mut self.defrag.selected_mode, index, mode.label());
                     }
                 });
-            ui.label(
-                egui::RichText::new(self.defrag.selected_mode().description())
-                    .color(t.muted),
-            );
+            ui.label(egui::RichText::new(self.defrag.selected_mode().description()).color(t.muted));
         });
 
-        let target = normalize_drive_target(&self.drive_target);
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(
-                    target.is_some() && !self.defrag.running,
-                    egui::Button::new("Analisar unidade"),
-                )
-                .clicked()
-            {
-                if let Some(drive) = target.clone() {
-                    self.defrag.analyze(drive);
-                }
+            let ready = self.defrag.selected_count() > 0 && !self.defrag.running && !self.defrag.detecting;
+            if ui.add_enabled(ready, egui::Button::new("Analisar unidades marcadas")).clicked() {
+                self.defrag.analyze_selected();
             }
-
-            if ui
-                .add_enabled(
-                    target.is_some() && !self.defrag.running,
-                    egui::Button::new("Otimizar + medir antes/depois"),
-                )
-                .clicked()
-            {
-                if let Some(drive) = target.clone() {
-                    let mode = self.defrag.selected_mode();
-                    self.defrag.optimize(drive, mode);
-                }
+            if ui.add_enabled(ready, egui::Button::new("Otimizar unidades marcadas + medir antes/depois")).clicked() {
+                self.defrag.optimize_selected(self.defrag.selected_mode());
             }
-
-            if ui
-                .add_enabled(self.defrag.running, egui::Button::new("Parar"))
-                .clicked()
-            {
+            if ui.add_enabled(self.defrag.running, egui::Button::new("Parar")).clicked() {
                 self.defrag.cancel();
             }
         });
@@ -1025,114 +1014,90 @@ impl FaxinaApp {
                 egui::ProgressBar::new((self.defrag.progress / 100.0).clamp(0.0, 1.0))
                     .show_percentage()
                     .text(format!(
-                        "{} • {:.0}%",
-                        self.defrag.phase, self.defrag.progress
+                        "{} {} • {:.0}%",
+                        self.defrag.current_drive,
+                        self.defrag.phase,
+                        self.defrag.progress
                     )),
             );
         }
         ui.label(&self.defrag.status);
+        ui.separator();
 
-        if let Some(snapshot) = self.defrag.current_snapshot() {
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.strong(format!(
-                    "{} {}",
-                    snapshot.info.drive,
-                    if snapshot.info.label.is_empty() {
-                        ""
-                    } else {
-                        &snapshot.info.label
-                    }
-                ));
-                ui.label(format!(
-                    "{} • {} • {} • {}",
-                    snapshot.info.file_system,
-                    snapshot.info.media_type,
-                    snapshot.info.bus_type,
-                    snapshot.info.health
-                ));
-                ui.label(format!(
-                    "Livre: {} / {}",
-                    defrag::format_bytes(snapshot.info.free),
-                    defrag::format_bytes(snapshot.info.size)
-                ));
-            });
-
-            ui.add_space(8.0);
-            ui.strong("Mapa proporcional");
-            draw_fragmentation_map(ui, snapshot, t.accent);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("■ Fragmentado").color(egui::Color32::from_rgb(220, 55, 55)));
-                ui.label(egui::RichText::new("■ Alocado").color(t.accent));
-                ui.label("Espaço livre = sem bloco");
-            });
-        }
-
-        if let Some(before) = &self.defrag.before {
-            ui.separator();
-            ui.strong("Resultado real antes/depois");
-            let after = self.defrag.after.as_ref();
-
-            egui::Grid::new("disk_before_after")
-                .num_columns(3)
-                .spacing([18.0, 6.0])
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("Métrica");
-                    ui.strong("Antes");
-                    ui.strong("Depois");
-                    ui.end_row();
-
-                    ui.label("Fragmentação");
-                    ui.label(format_optional_percent(before.fragmentation_percent));
-                    ui.label(after.map(|x| format_optional_percent(x.fragmentation_percent)).unwrap_or_else(|| "—".into()));
-                    ui.end_row();
-
-                    ui.label("Arquivos fragmentados");
-                    ui.label(format_optional_u64(before.fragmented_files));
-                    ui.label(after.map(|x| format_optional_u64(x.fragmented_files)).unwrap_or_else(|| "—".into()));
-                    ui.end_row();
-
-                    ui.label("Espaço livre");
-                    ui.label(defrag::format_bytes(before.info.free));
-                    ui.label(after.map(|x| defrag::format_bytes(x.info.free)).unwrap_or_else(|| "—".into()));
-                    ui.end_row();
-
-                    ui.label("Leitura sequencial WinSAT");
-                    ui.label(before.sequential_read_mbps.map(|x| format!("{x:.1} MB/s")).unwrap_or_else(|| "indisponível".into()));
-                    ui.label(after.and_then(|x| x.sequential_read_mbps).map(|x| format!("{x:.1} MB/s")).unwrap_or_else(|| "—".into()));
-                    ui.end_row();
-
-                    ui.label("Leitura aleatória WinSAT");
-                    ui.label(before.random_read_mbps.map(|x| format!("{x:.1} MB/s")).unwrap_or_else(|| "indisponível".into()));
-                    ui.label(after.and_then(|x| x.random_read_mbps).map(|x| format!("{x:.1} MB/s")).unwrap_or_else(|| "—".into()));
-                    ui.end_row();
+        for report in &self.defrag.reports {
+            let after = report.after.as_ref();
+            let current = after.unwrap_or(&report.before);
+            egui::CollapsingHeader::new(format!(
+                "{} • {}",
+                report.drive,
+                report.status
+            ))
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(format!(
+                        "{} {}",
+                        current.info.drive,
+                        current.info.label
+                    ));
+                    ui.label(format!(
+                        "{} • {} • {} • {}",
+                        current.info.file_system,
+                        current.info.media_type,
+                        current.info.bus_type,
+                        current.info.health
+                    ));
+                });
+                ui.add_space(5.0);
+                ui.strong("Mapa proporcional após a última medição");
+                draw_fragmentation_map(ui, current, t.accent);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("■ Fragmentado").color(egui::Color32::from_rgb(220,55,55)));
+                    ui.label(egui::RichText::new("■ Alocado").color(t.accent));
+                    ui.label("Espaço livre = sem bloco");
                 });
 
-            if let Some(after) = after {
-                ui.small(format!(
-                    "Variação medida: sequencial {} • aleatória {}",
-                    defrag::performance_delta(
-                        before.sequential_read_mbps,
-                        after.sequential_read_mbps
-                    ),
-                    defrag::performance_delta(
-                        before.random_read_mbps,
-                        after.random_read_mbps
-                    )
-                ));
-                ui.small("WinSAT mede leitura no momento do teste; diferenças pequenas podem refletir cache, temperatura, carga do sistema e características do SSD/HDD.");
-            }
+                ui.add_space(5.0);
+                egui::Grid::new(format!("drive_report_{}", report.drive))
+                    .num_columns(3)
+                    .spacing([18.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Métrica"); ui.strong("Antes"); ui.strong("Depois"); ui.end_row();
+                        ui.label("Fragmentação");
+                        ui.label(format_optional_percent(report.before.fragmentation_percent));
+                        ui.label(after.map(|x| format_optional_percent(x.fragmentation_percent)).unwrap_or_else(|| "—".into()));
+                        ui.end_row();
+                        ui.label("Arquivos fragmentados");
+                        ui.label(format_optional_u64(report.before.fragmented_files));
+                        ui.label(after.map(|x| format_optional_u64(x.fragmented_files)).unwrap_or_else(|| "—".into()));
+                        ui.end_row();
+                        ui.label("Espaço livre");
+                        ui.label(defrag::format_bytes(report.before.info.free));
+                        ui.label(after.map(|x| defrag::format_bytes(x.info.free)).unwrap_or_else(|| "—".into()));
+                        ui.end_row();
+                        ui.label("Leitura sequencial WinSAT");
+                        ui.label(report.before.sequential_read_mbps.map(|x|format!("{x:.1} MB/s")).unwrap_or_else(||"indisponível".into()));
+                        ui.label(after.and_then(|x|x.sequential_read_mbps).map(|x|format!("{x:.1} MB/s")).unwrap_or_else(||"—".into()));
+                        ui.end_row();
+                        ui.label("Leitura aleatória WinSAT");
+                        ui.label(report.before.random_read_mbps.map(|x|format!("{x:.1} MB/s")).unwrap_or_else(||"indisponível".into()));
+                        ui.label(after.and_then(|x|x.random_read_mbps).map(|x|format!("{x:.1} MB/s")).unwrap_or_else(||"—".into()));
+                        ui.end_row();
+                    });
+
+                if let Some(after) = after {
+                    ui.small(format!(
+                        "Variação medida: sequencial {} • aleatória {}",
+                        defrag::performance_delta(report.before.sequential_read_mbps, after.sequential_read_mbps),
+                        defrag::performance_delta(report.before.random_read_mbps, after.random_read_mbps)
+                    ));
+                }
+            });
         }
 
         if !self.defrag.output.trim().is_empty() {
-            egui::CollapsingHeader::new("Saída detalhada do Windows")
-                .show(ui, |ui| output_box(ui, &self.defrag.output));
-        }
-
-        if !self.last_output.trim().is_empty() {
-            egui::CollapsingHeader::new("Inventário de unidades")
-                .show(ui, |ui| output_box(ui, &self.last_output));
+            egui::CollapsingHeader::new("Saída detalhada do Windows").show(ui, |ui| output_box(ui, &self.defrag.output));
         }
     }
 
@@ -1172,62 +1137,84 @@ impl FaxinaApp {
     }
 
     fn page_winsxs(&mut self, ui: &mut egui::Ui) {
+        self.winsxs.poll();
+        if self.winsxs.running {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        }
         let t = themes()[self.theme_index].clone();
-        ui.label("O WinSxS é tratado somente por DISM/CBS. Nunca apagamos arquivos diretamente da pasta do Component Store.");
+        ui.label("WinSxS é mantido exclusivamente por DISM/CBS. O Faxina mede antes e depois; nunca apaga arquivos diretamente da pasta.");
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Analisar tamanho e recuperável").clicked() {
+            if ui.add_enabled(!self.winsxs.running, egui::Button::new("Analisar tamanho e ganho potencial")).clicked() {
                 self.winsxs.analyze();
             }
-            if ui.button("Limpar Component Store").clicked() {
-                self.elevated_cmd(
-                    "Limpeza WinSxS",
-                    "DISM /Online /Cleanup-Image /StartComponentCleanup",
-                );
+            if ui.add_enabled(!self.winsxs.running, egui::Button::new("Limpar Component Store + medir ganho")).clicked() {
+                self.winsxs.cleanup(false);
             }
-            if ui.button("ResetBase (irreversível)").clicked() {
-                self.elevated_cmd(
-                    "ResetBase",
-                    "echo ATENCAO: apos ResetBase atualizacoes instaladas nao poderao ser desinstaladas. && pause && DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase",
-                );
+            if ui.add_enabled(!self.winsxs.running, egui::Button::new("ResetBase + medir ganho (irreversível)")).clicked() {
+                self.winsxs.cleanup(true);
             }
         });
 
+        if self.winsxs.running {
+            ui.add(
+                egui::ProgressBar::new(self.winsxs.progress as f32 / 100.0)
+                    .show_percentage()
+                    .text(&self.winsxs.operation),
+            );
+        }
         if !self.winsxs.status.is_empty() {
-            ui.label(egui::RichText::new(&self.winsxs.status).color(t.accent));
+            ui.label(egui::RichText::new(&self.winsxs.status).color(t.accent).strong());
+        }
+
+        if let Some(bytes) = self.winsxs.estimated_gain_bytes {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Potencial conhecido antes da limpeza (backups + cache): {}",
+                    winsxs::format_bytes(bytes)
+                ))
+                .size(17.0)
+                .strong()
+                .color(t.accent),
+            );
+            ui.small("É uma estimativa parcial: DISM não promete que todo esse valor será liberado, devido a hardlinks e dependências.");
+        }
+        if let Some(bytes) = self.winsxs.last_gain_bytes {
+            ui.label(
+                egui::RichText::new(format!(
+                    "GANHO REAL DE ESPAÇO LIVRE APÓS A OPERAÇÃO: {}",
+                    winsxs::format_bytes(bytes)
+                ))
+                .size(19.0)
+                .strong()
+                .color(t.accent),
+            );
+        }
+        if let Some(bytes) = self.winsxs.last_store_gain_bytes {
+            ui.label(format!(
+                "Redução medida no tamanho real do Component Store: {}",
+                winsxs::format_bytes(bytes)
+            ));
         }
 
         if self.winsxs.has_summary() {
             egui::Grid::new("winsxs_summary")
                 .num_columns(2)
                 .spacing([18.0, 8.0])
+                .striped(true)
                 .show(ui, |ui| {
-                    ui.label("Tamanho reportado pelo Explorer");
-                    ui.strong(&self.winsxs.explorer_size);
-                    ui.end_row();
-                    ui.label("Tamanho real do Component Store");
-                    ui.strong(&self.winsxs.actual_size);
-                    ui.end_row();
-                    ui.label("Compartilhado com o Windows");
-                    ui.label(&self.winsxs.shared_size);
-                    ui.end_row();
-                    ui.label("Backups / recursos desativados");
-                    ui.label(&self.winsxs.backups_size);
-                    ui.end_row();
-                    ui.label("Cache / dados temporários");
-                    ui.label(&self.winsxs.cache_size);
-                    ui.end_row();
-                    ui.label("Pacotes recuperáveis");
-                    ui.strong(&self.winsxs.reclaimable_packages);
-                    ui.end_row();
-                    ui.label("Windows recomenda limpeza");
-                    ui.strong(&self.winsxs.recommended);
-                    ui.end_row();
+                    ui.label("Tamanho reportado pelo Explorer"); ui.strong(&self.winsxs.explorer_size); ui.end_row();
+                    ui.label("Tamanho real do Component Store"); ui.strong(&self.winsxs.actual_size); ui.end_row();
+                    ui.label("Compartilhado com o Windows"); ui.label(&self.winsxs.shared_size); ui.end_row();
+                    ui.label("Backups / recursos desativados"); ui.label(&self.winsxs.backups_size); ui.end_row();
+                    ui.label("Cache / dados temporários"); ui.label(&self.winsxs.cache_size); ui.end_row();
+                    ui.label("Pacotes recuperáveis"); ui.strong(&self.winsxs.reclaimable_packages); ui.end_row();
+                    ui.label("Windows recomenda limpeza"); ui.strong(&self.winsxs.recommended); ui.end_row();
                 });
-            ui.add_space(8.0);
         }
-
-        ui.small("Backups/cache e pacotes recuperáveis indicam o potencial de limpeza, mas não são promessa de bytes exatos por causa de hardlinks e dependências do Component Store. Analise novamente depois da limpeza para comparar.");
-        output_box(ui, &self.winsxs.raw);
+        ui.small("ResetBase impede desinstalar atualizações substituídas. Use somente quando aceitar essa consequência.");
+        if !self.winsxs.raw.trim().is_empty() {
+            egui::CollapsingHeader::new("Saída detalhada do DISM").show(ui, |ui| output_box(ui, &self.winsxs.raw));
+        }
     }
 
     fn page_drivers(&mut self, ui: &mut egui::Ui) {
