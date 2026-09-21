@@ -8,6 +8,7 @@ mod duplicates;
 mod optimizer_db;
 mod portable_browsers;
 mod portable_mail;
+mod uninstaller;
 mod residue_scan;
 mod services;
 mod startup;
@@ -68,6 +69,7 @@ enum Section {
     WinSxS,
     Discos,
     Drivers,
+    Uninstaller,
     Registro,
     Inicializacao,
     Tarefas,
@@ -95,6 +97,7 @@ impl Section {
             (Section::WinSxS, "▦", "WinSxS"),
             (Section::Discos, "◉", "Discos / SSD"),
             (Section::Drivers, "D", "Drivers"),
+            (Section::Uninstaller, "U", "Faxina Uninstaller"),
             (Section::Registro, "R", "Registro"),
             (Section::Inicializacao, "↗", "Inicialização"),
             (Section::Tarefas, "✓", "Tarefas agendadas"),
@@ -179,6 +182,7 @@ struct FaxinaApp {
     winsxs: winsxs::WinSxsState,
     defrag: defrag::DefragState,
     drivers: drivers::DriverState,
+    uninstaller: uninstaller::UninstallerState,
     inventory: windows_inventory::WindowsInventory,
     startup: startup::StartupState,
     services: services::ServiceState,
@@ -228,6 +232,7 @@ impl FaxinaApp {
             winsxs: winsxs::WinSxsState::default(),
             defrag,
             drivers: drivers::DriverState::default(),
+            uninstaller: uninstaller::UninstallerState::load(&root),
             inventory: windows_inventory::WindowsInventory::default(),
             startup: startup::StartupState::default(),
             services: services::ServiceState::default(),
@@ -1500,6 +1505,380 @@ impl FaxinaApp {
         }
     }
 
+    fn page_uninstaller(&mut self, ui: &mut egui::Ui) {
+        self.uninstaller.poll(&portable_root());
+        if self.uninstaller.busy {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
+        let t = themes()[self.theme_index].clone();
+        ui.label("Desinstalação com inventário, sobras classificadas, quarentena e histórico. O desinstalador oficial sempre vem primeiro quando existe.");
+        ui.small("Sobras classificadas como Seguro vêm marcadas. Itens Revisar nunca são marcados automaticamente porque podem conter dados ou componentes compartilhados.");
+
+        ui.horizontal_wrapped(|ui| {
+            for tab in uninstaller::UninstallerTab::ALL {
+                if ui
+                    .selectable_label(self.uninstaller.tab == tab, tab.label())
+                    .clicked()
+                {
+                    self.uninstaller.tab = tab;
+                }
+            }
+        });
+        ui.separator();
+
+        if self.uninstaller.busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.strong(&self.uninstaller.status);
+            });
+        } else {
+            ui.label(&self.uninstaller.status);
+        }
+
+        match self.uninstaller.tab {
+            uninstaller::UninstallerTab::Programs => {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Atualizar programas").clicked() {
+                        self.uninstaller.start_refresh_programs();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.uninstaller.busy && self.uninstaller.selected_programs() > 0,
+                            egui::Button::new("Desinstalar selecionados / fila"),
+                        )
+                        .clicked()
+                    {
+                        self.uninstaller.start_uninstall_selected();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.uninstaller.busy && self.uninstaller.selected_programs() == 1,
+                            egui::Button::new("Analisar sobras do selecionado"),
+                        )
+                        .clicked()
+                    {
+                        self.uninstaller.start_scan_selected_program_residues();
+                    }
+                    if ui.button("Desmarcar todos").clicked() {
+                        for program in &mut self.uninstaller.programs {
+                            program.checked = false;
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Buscar:");
+                    ui.text_edit_singleline(&mut self.uninstaller.filter);
+                    ui.small(format!(
+                        "{} selecionado(s) / {} programas",
+                        self.uninstaller.selected_programs(),
+                        self.uninstaller.programs.len()
+                    ));
+                });
+
+                let filter = self.uninstaller.filter.trim().to_ascii_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt("uninstaller_programs")
+                    .show(ui, |ui| {
+                        for program in &mut self.uninstaller.programs {
+                            if !filter.is_empty()
+                                && !program.name.to_ascii_lowercase().contains(&filter)
+                                && !program.publisher.to_ascii_lowercase().contains(&filter)
+                            {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut program.checked, "");
+                                ui.vertical(|ui| {
+                                    ui.strong(&program.name);
+                                    let meta = format!(
+                                        "{}{}{}",
+                                        program.publisher,
+                                        if program.publisher.is_empty() || program.version.is_empty() {
+                                            ""
+                                        } else {
+                                            " • "
+                                        },
+                                        program.version
+                                    );
+                                    if !meta.is_empty() {
+                                        ui.small(egui::RichText::new(meta).color(t.muted));
+                                    }
+                                    if !program.install_location.is_empty() {
+                                        ui.small(&program.install_location);
+                                    }
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if program.estimated_size_kb > 0 {
+                                            ui.label(fmt_bytes(
+                                                program.estimated_size_kb.saturating_mul(1024),
+                                            ));
+                                        }
+                                    },
+                                );
+                            });
+                            ui.separator();
+                        }
+                    });
+            }
+            uninstaller::UninstallerTab::WindowsApps => {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Atualizar Windows Apps").clicked() {
+                        self.uninstaller.start_refresh_apps();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.uninstaller.busy && self.uninstaller.selected_apps() > 0,
+                            egui::Button::new("Remover apps selecionados"),
+                        )
+                        .clicked()
+                    {
+                        self.uninstaller.start_remove_selected_apps();
+                    }
+                    if ui.button("Desmarcar todos").clicked() {
+                        for app in &mut self.uninstaller.apps {
+                            app.checked = false;
+                        }
+                    }
+                });
+                ui.small("Frameworks e pacotes marcados pelo Windows como não removíveis permanecem protegidos.");
+                egui::ScrollArea::vertical()
+                    .id_salt("uninstaller_appx")
+                    .show(ui, |ui| {
+                        for app in &mut self.uninstaller.apps {
+                            ui.horizontal(|ui| {
+                                let enabled = !app.non_removable && !app.is_framework;
+                                ui.add_enabled_ui(enabled, |ui| {
+                                    ui.checkbox(&mut app.checked, "");
+                                });
+                                ui.vertical(|ui| {
+                                    ui.strong(&app.name);
+                                    ui.small(format!("{} • {}", app.version, app.publisher));
+                                    if app.non_removable || app.is_framework {
+                                        ui.small(
+                                            egui::RichText::new("Protegido pelo Windows/Faxina")
+                                                .color(t.muted),
+                                        );
+                                    }
+                                });
+                            });
+                            ui.separator();
+                        }
+                    });
+            }
+            uninstaller::UninstallerTab::Forced => {
+                ui.label("Desinstalação forçada / Modo Alvo");
+                ui.small("Aponte para um EXE ou pasta de um programa quebrado. O Faxina reconstrói relações com Registro, inicialização, serviços, tarefas e dados remanescentes sem apagar nada automaticamente.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.text_edit_singleline(&mut self.uninstaller.forced_path);
+                    if ui.button("Escolher EXE").clicked() {
+                        if let Some(path) = pick_file_dialog(
+                            "Executáveis (*.exe)|*.exe|Todos os arquivos (*.*)|*.*",
+                        ) {
+                            self.uninstaller.forced_path =
+                                path.to_string_lossy().to_string();
+                        }
+                    }
+                    if ui.button("Escolher pasta").clicked() {
+                        if let Some(path) = pick_folder_dialog() {
+                            self.uninstaller.forced_path =
+                                path.to_string_lossy().to_string();
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.uninstaller.busy
+                                && !self.uninstaller.forced_path.trim().is_empty(),
+                            egui::Button::new("Analisar instalação forçada"),
+                        )
+                        .clicked()
+                    {
+                        self.uninstaller.start_forced_scan();
+                    }
+                });
+
+                ui.separator();
+                ui.label("Modo Alvo por processo");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Atualizar processos").clicked() {
+                        self.uninstaller.start_refresh_processes();
+                    }
+                    ui.label("Filtro:");
+                    ui.text_edit_singleline(&mut self.uninstaller.process_filter);
+                    if ui
+                        .add_enabled(
+                            self.uninstaller.processes.iter().any(|p| p.checked),
+                            egui::Button::new("Usar processo marcado"),
+                        )
+                        .clicked()
+                    {
+                        self.uninstaller.use_checked_process_as_target();
+                    }
+                });
+                let filter = self
+                    .uninstaller
+                    .process_filter
+                    .trim()
+                    .to_ascii_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt("uninstaller_processes")
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        let mut newly_checked: Option<u32> = None;
+                        for process in &mut self.uninstaller.processes {
+                            if !filter.is_empty()
+                                && !process.name.to_ascii_lowercase().contains(&filter)
+                                && !process.path.to_ascii_lowercase().contains(&filter)
+                            {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.checkbox(&mut process.checked, "").clicked()
+                                    && process.checked
+                                {
+                                    newly_checked = Some(process.id);
+                                }
+                                ui.vertical(|ui| {
+                                    ui.strong(format!("{} • PID {}", process.name, process.id));
+                                    ui.small(&process.path);
+                                });
+                            });
+                        }
+                        if let Some(pid) = newly_checked {
+                            for process in &mut self.uninstaller.processes {
+                                process.checked = process.id == pid;
+                            }
+                        }
+                    });
+            }
+            uninstaller::UninstallerTab::Monitor => {
+                ui.label("Instalação monitorada");
+                ui.small("1) Antes de instalar, crie o snapshot. 2) Instale o programa normalmente. 3) Compare. O Faxina registra novas entradas Uninstall e novos diretórios-base para facilitar uma remoção futura.");
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.uninstaller.busy,
+                            egui::Button::new("1. Criar snapshot antes"),
+                        )
+                        .clicked()
+                    {
+                        self.uninstaller.start_create_snapshot(&portable_root());
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.uninstaller.busy,
+                            egui::Button::new("3. Comparar depois da instalação"),
+                        )
+                        .clicked()
+                    {
+                        self.uninstaller.start_compare_snapshot(&portable_root());
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("uninstaller_monitor")
+                    .show(ui, |ui| {
+                        for item in &self.uninstaller.monitor_result {
+                            ui.label(item);
+                        }
+                    });
+            }
+            uninstaller::UninstallerTab::History => {
+                ui.label("Histórico persistente do Faxina Uninstaller");
+                ui.small("As ações ficam registradas em logs\\uninstaller-history.jsonl.");
+                egui::ScrollArea::vertical()
+                    .id_salt("uninstaller_history")
+                    .show(ui, |ui| {
+                        for entry in &self.uninstaller.history {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.strong(&entry.action);
+                                    ui.label(if entry.success { "✓" } else { "!" });
+                                    ui.label(&entry.target);
+                                });
+                                if !entry.detail.is_empty() {
+                                    ui.small(&entry.detail);
+                                }
+                                ui.small(format!("Epoch: {}", entry.time));
+                            });
+                        }
+                    });
+            }
+        }
+
+        if !self.uninstaller.residues.is_empty() {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.heading(format!("Sobras — {}", self.uninstaller.last_target));
+                if ui.button("Marcar somente seguros").clicked() {
+                    self.uninstaller.mark_safe_residues();
+                }
+                if ui.button("Desmarcar tudo").clicked() {
+                    self.uninstaller.clear_residue_selection();
+                }
+                if ui
+                    .add_enabled(
+                        !self.uninstaller.busy && self.uninstaller.selected_residues() > 0,
+                        egui::Button::new("Backup/quarentena + remover selecionados"),
+                    )
+                    .clicked()
+                {
+                    self.uninstaller.start_remove_selected_residues(&portable_root());
+                }
+            });
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} sobra(s) selecionada(s) • {}",
+                    self.uninstaller.selected_residues(),
+                    fmt_bytes(self.uninstaller.selected_residue_size())
+                ))
+                .strong()
+                .color(t.accent),
+            );
+
+            egui::ScrollArea::vertical()
+                .id_salt("uninstaller_residues")
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for item in &mut self.uninstaller.residues {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut item.checked, "");
+                            ui.vertical(|ui| {
+                                ui.strong(format!(
+                                    "{} • {}",
+                                    item.risk.label(),
+                                    item.kind.label()
+                                ));
+                                ui.small(&item.path);
+                                ui.small(&item.reason);
+                                ui.small(
+                                    egui::RichText::new(format!("Evidência: {}", item.evidence))
+                                        .color(t.muted),
+                                );
+                                if let Some(error) = &item.error {
+                                    ui.small(
+                                        egui::RichText::new(error).color(t.accent),
+                                    );
+                                }
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if item.size > 0 {
+                                        ui.label(fmt_bytes(item.size));
+                                    }
+                                },
+                            );
+                        });
+                        ui.separator();
+                    }
+                });
+        }
+    }
+
     fn page_registry(&mut self, ui: &mut egui::Ui) {
         self.inventory.poll_registry_cleanup();
         self.inventory.poll_registry_scan();
@@ -2607,6 +2986,7 @@ impl eframe::App for FaxinaApp {
                 Section::WinSxS => self.page_winsxs(ui),
                 Section::Discos => self.page_disks(ui),
                 Section::Drivers => self.page_drivers(ui),
+                Section::Uninstaller => self.page_uninstaller(ui),
                 Section::Registro => self.page_registry(ui),
                 Section::Inicializacao => self.page_startup(ui),
                 Section::Tarefas => self.page_tasks(ui),
