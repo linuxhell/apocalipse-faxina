@@ -23,6 +23,8 @@ pub struct TaskEntry {
     pub state: String,
     #[serde(rename = "Actions", default)]
     pub actions: String,
+    #[serde(rename = "IsWindows", default)]
+    pub is_windows: bool,
     #[serde(skip)]
     pub checked: bool,
 }
@@ -83,7 +85,6 @@ impl WindowsInventory {
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $items = @(
   Get-ScheduledTask -ErrorAction SilentlyContinue |
-    Where-Object { $_.TaskPath -notlike '\Microsoft\*' } |
     ForEach-Object {
       $actions = @($_.Actions | ForEach-Object {
         $e = [string]$_.Execute
@@ -96,6 +97,7 @@ $items = @(
         Author   = [string]$_.Author
         State    = [string]$_.State
         Actions  = [string]$actions
+        IsWindows = [bool]([string]$_.TaskPath -like '\Microsoft\*')
       }
     }
 )
@@ -104,13 +106,16 @@ $items = @(
         match run_json::<TaskEntry>(SCRIPT) {
             Ok(mut items) => {
                 items.sort_by(|a, b| {
-                    a.task_path
-                        .cmp(&b.task_path)
+                    a.is_windows
+                        .cmp(&b.is_windows)
+                        .then_with(|| a.task_path.cmp(&b.task_path))
                         .then_with(|| a.task_name.cmp(&b.task_name))
                 });
+                let windows = items.iter().filter(|x| x.is_windows).count();
+                let programs = items.len().saturating_sub(windows);
                 self.task_status = format!(
-                    "{} tarefas não-Microsoft encontradas. Tarefas nativas do Windows ficam ocultas.",
-                    items.len()
+                    "{} usuário/programas • {} Windows",
+                    programs, windows
                 );
                 self.tasks = items;
             }
@@ -118,8 +123,12 @@ $items = @(
         }
     }
 
-    pub fn task_action_command(&self, enable: bool) -> Option<String> {
-        let selected: Vec<&TaskEntry> = self.tasks.iter().filter(|x| x.checked).collect();
+    pub fn task_action_script(&self, enable: bool, windows_scope: bool) -> Option<String> {
+        let selected: Vec<&TaskEntry> = self
+            .tasks
+            .iter()
+            .filter(|x| x.checked && x.is_windows == windows_scope)
+            .collect();
         if selected.is_empty() {
             return None;
         }
@@ -128,22 +137,20 @@ $items = @(
         } else {
             "Disable-ScheduledTask"
         };
-        let statements = selected
-            .into_iter()
-            .map(|task| {
-                format!(
-                    "{} -TaskPath '{}' -TaskName '{}' -ErrorAction Continue",
-                    verb,
-                    ps_quote(&task.task_path),
-                    ps_quote(&task.task_name)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        Some(format!(
-            "powershell -NoProfile -Command \"{}\"",
-            statements.replace('"', "\\\"")
-        ))
+        Some(
+            selected
+                .into_iter()
+                .map(|task| {
+                    format!(
+                        "{} -TaskPath '{}' -TaskName '{}' -ErrorAction Continue | Out-Null",
+                        verb,
+                        ps_quote(&task.task_path),
+                        ps_quote(&task.task_name)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
     }
 
     pub fn scan_shell(&mut self) {

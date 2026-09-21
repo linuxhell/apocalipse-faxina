@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod development;
+mod drivers;
 mod duplicates;
 mod portable_browsers;
 mod residue_scan;
+mod services;
 mod startup;
 mod winapp2;
 mod windows_inventory;
@@ -164,11 +166,13 @@ struct FaxinaApp {
     development: development::DevelopmentState,
     winsxs: winsxs::WinSxsState,
     drive_target: String,
-    driver_inf: String,
+    drivers: drivers::DriverState,
     inventory: windows_inventory::WindowsInventory,
     startup: startup::StartupState,
-    service_name: String,
+    services: services::ServiceState,
     hide_microsoft_services: bool,
+    service_user_only: bool,
+    task_view_windows: bool,
     show_windows_shell: bool,
     busy_label: String,
     about_background: Option<egui::TextureHandle>,
@@ -205,11 +209,13 @@ impl FaxinaApp {
             development: development::DevelopmentState::default(),
             winsxs: winsxs::WinSxsState::default(),
             drive_target: "C:".into(),
-            driver_inf: String::new(),
+            drivers: drivers::DriverState::default(),
             inventory: windows_inventory::WindowsInventory::default(),
             startup: startup::StartupState::default(),
-            service_name: String::new(),
+            services: services::ServiceState::default(),
             hide_microsoft_services: true,
+            service_user_only: false,
+            task_view_windows: false,
             show_windows_shell: false,
             busy_label: String::new(),
             about_background,
@@ -1056,33 +1062,105 @@ impl FaxinaApp {
     }
 
     fn page_drivers(&mut self, ui: &mut egui::Ui) {
-        ui.label("Fluxo padrão: identificar versões antigas → remover normalmente → usar modo forçado somente se a remoção normal falhar.");
-        ui.horizontal(|ui| {
+        let t = themes()[self.theme_index].clone();
+        ui.label("Driver Store organizado por categoria. O Faxina só marca automaticamente como antigo um pacote redundante que não está em uso, não é Inbox e não é crítico de inicialização.");
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Analisar Driver Store").clicked() {
-                self.capture("Enumerando drivers", "pnputil.exe", &["/enum-drivers"]);
+                self.drivers.scan();
             }
-            if ui.button("Ver dispositivos e drivers").clicked() {
-                self.capture("Enumerando dispositivos", "pnputil.exe", &["/enum-devices","/connected","/drivers"]);
+            if ui.button("Selecionar drivers antigos").clicked() {
+                self.drivers.select_old();
+            }
+            if ui.button("Desmarcar todos").clicked() {
+                self.drivers.clear_selection();
+            }
+            if ui
+                .add_enabled(
+                    self.drivers.has_selected(),
+                    egui::Button::new("Remover selecionados"),
+                )
+                .clicked()
+            {
+                self.drivers.remove_selected(false);
+            }
+            if ui
+                .add_enabled(
+                    self.drivers.has_failed_selected(),
+                    egui::Button::new("Forçar falhas selecionadas"),
+                )
+                .clicked()
+            {
+                self.drivers.remove_selected(true);
             }
         });
+
+        ui.label(&self.drivers.status);
+        ui.small("A remoção normal é tentada primeiro. O modo forçado só fica disponível para pacotes que falharam e continua bloqueando drivers atualmente em uso.");
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("INF antigo:");
-            ui.text_edit_singleline(&mut self.driver_inf);
-            if ui.button("Remover normal").clicked() {
-                let inf = self.driver_inf.trim().to_string();
-                if inf.to_ascii_lowercase().starts_with("oem") && inf.to_ascii_lowercase().ends_with(".inf") {
-                    self.elevated_cmd("Remoção normal", &format!("pnputil /delete-driver {}", inf));
-                } else { self.last_output = "Informe um pacote no formato oemNN.inf".into(); }
-            }
-            if ui.button("Forçar se falhou").clicked() {
-                let inf = self.driver_inf.trim().to_string();
-                if inf.to_ascii_lowercase().starts_with("oem") && inf.to_ascii_lowercase().ends_with(".inf") {
-                    self.elevated_cmd("Remoção forçada", &format!("echo MODO FORCADO - {} && pause && pnputil /delete-driver {} /force", inf, inf));
-                } else { self.last_output = "Informe um pacote no formato oemNN.inf".into(); }
+
+        let mut current_category = String::new();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for driver in &mut self.drivers.items {
+                let category = driver.category().to_string();
+                if category != current_category {
+                    if !current_category.is_empty() {
+                        ui.add_space(8.0);
+                    }
+                    current_category = category.clone();
+                    ui.heading(
+                        egui::RichText::new(category)
+                            .size(15.0)
+                            .color(t.accent),
+                    );
+                    ui.separator();
+                }
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut driver.checked, "");
+                    ui.vertical(|ui| {
+                        ui.strong(format!(
+                            "{} • {}",
+                            driver.published_name,
+                            if driver.provider_name.is_empty() {
+                                "Fornecedor não informado"
+                            } else {
+                                &driver.provider_name
+                            }
+                        ));
+                        ui.small(format!(
+                            "Classe: {} • Versão: {} • Data: {} • Driver Store: {}",
+                            driver.class_name,
+                            driver.version,
+                            driver.date,
+                            driver.store_date
+                        ));
+                        if !driver.devices.is_empty() {
+                            ui.small(format!("Dispositivo(s): {}", driver.devices));
+                        }
+                        ui.small(
+                            egui::RichText::new(format!(
+                                "{} • {}",
+                                driver.state_label(),
+                                fmt_bytes(driver.size)
+                            ))
+                            .color(if driver.old_candidate { t.accent } else { t.muted }),
+                        );
+                        if let Some(error) = &driver.error {
+                            ui.small(
+                                egui::RichText::new(format!("Falha: {error}"))
+                                    .color(t.accent),
+                            );
+                        }
+                    });
+                });
+                ui.separator();
             }
         });
-        output_box(ui, &self.last_output);
+
+        if !self.drivers.output.trim().is_empty() {
+            egui::CollapsingHeader::new("Detalhes da última operação")
+                .show(ui, |ui| output_box(ui, &self.drivers.output));
+        }
     }
 
     fn page_registry(&mut self, ui: &mut egui::Ui) {
@@ -1103,7 +1181,10 @@ impl FaxinaApp {
                 }
             }
             if ui.button("Abrir Editor do Registro").clicked() {
-                let _ = Command::new("regedit.exe").spawn();
+                match open_registry_editor() {
+                    Ok(_) => self.last_output = "Editor do Registro aberto.".into(),
+                    Err(error) => self.last_output = format!("Falha ao abrir o Editor do Registro: {error}"),
+                }
             }
         });
 
@@ -1236,14 +1317,52 @@ impl FaxinaApp {
 
     fn page_tasks(&mut self, ui: &mut egui::Ui) {
         let t = themes()[self.theme_index].clone();
-        ui.label("Mostra somente tarefas criadas pelo usuário ou por programas. A árvore \\Microsoft\\ do Windows fica escondida.");
+        ui.label("Alterne entre tarefas do usuário/programas e tarefas nativas do Windows.");
+
         ui.horizontal_wrapped(|ui| {
+            if ui
+                .selectable_label(
+                    !self.task_view_windows,
+                    "Tarefas do usuário/programas",
+                )
+                .clicked()
+            {
+                self.task_view_windows = false;
+                for task in &mut self.inventory.tasks {
+                    task.checked = false;
+                }
+                if self.inventory.tasks.is_empty() {
+                    self.inventory.scan_tasks();
+                }
+            }
+            if ui
+                .selectable_label(self.task_view_windows, "Tarefas do Windows")
+                .clicked()
+            {
+                self.task_view_windows = true;
+                for task in &mut self.inventory.tasks {
+                    task.checked = false;
+                }
+                if self.inventory.tasks.is_empty() {
+                    self.inventory.scan_tasks();
+                }
+            }
             if ui.button("Atualizar lista").clicked() {
                 self.inventory.scan_tasks();
             }
-            if ui.button("Marcar todas").clicked() {
+        });
+
+        let visible_count = self
+            .inventory
+            .tasks
+            .iter()
+            .filter(|task| task.is_windows == self.task_view_windows)
+            .count();
+
+        ui.horizontal_wrapped(|ui| {
+            if !self.task_view_windows && ui.button("Marcar todas").clicked() {
                 for task in &mut self.inventory.tasks {
-                    task.checked = true;
+                    task.checked = !task.is_windows;
                 }
             }
             if ui.button("Desmarcar todas").clicked() {
@@ -1251,43 +1370,67 @@ impl FaxinaApp {
                     task.checked = false;
                 }
             }
+
+            let selected_visible = self
+                .inventory
+                .tasks
+                .iter()
+                .any(|task| task.checked && task.is_windows == self.task_view_windows);
+
             if ui
-                .add_enabled(
-                    self.inventory.tasks.iter().any(|x| x.checked),
-                    egui::Button::new("Desativar selecionadas"),
-                )
+                .add_enabled(selected_visible, egui::Button::new("Desativar selecionadas"))
                 .clicked()
             {
-                if let Some(command) = self.inventory.task_action_command(false) {
-                    self.elevated_cmd("Desativar tarefas selecionadas", &command);
+                if let Some(script) =
+                    self.inventory.task_action_script(false, self.task_view_windows)
+                {
+                    self.last_output = run_capture(
+                        "powershell.exe",
+                        &["-NoProfile", "-Command", &script],
+                    );
+                    self.inventory.scan_tasks();
                 }
             }
             if ui
-                .add_enabled(
-                    self.inventory.tasks.iter().any(|x| x.checked),
-                    egui::Button::new("Ativar selecionadas"),
-                )
+                .add_enabled(selected_visible, egui::Button::new("Ativar selecionadas"))
                 .clicked()
             {
-                if let Some(command) = self.inventory.task_action_command(true) {
-                    self.elevated_cmd("Ativar tarefas selecionadas", &command);
+                if let Some(script) =
+                    self.inventory.task_action_script(true, self.task_view_windows)
+                {
+                    self.last_output = run_capture(
+                        "powershell.exe",
+                        &["-NoProfile", "-Command", &script],
+                    );
+                    self.inventory.scan_tasks();
                 }
             }
         });
-        ui.label(&self.inventory.task_status);
+
+        ui.label(format!(
+            "{} • {} tarefa(s) nesta aba",
+            self.inventory.task_status, visible_count
+        ));
+        if self.task_view_windows {
+            ui.small("Proteção: não existe 'Marcar todas' na aba Windows. As tarefas nativas devem ser selecionadas individualmente.");
+        }
         ui.separator();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for task in &mut self.inventory.tasks {
+                if task.is_windows != self.task_view_windows {
+                    continue;
+                }
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut task.checked, "");
                     ui.vertical(|ui| {
                         ui.strong(&task.task_name);
                         ui.small(format!(
-                            "{} • {} • {}",
+                            "{} • {} • {}{}",
                             task.task_path,
                             if task.author.is_empty() { "autor não informado" } else { &task.author },
-                            task.state
+                            task.state,
+                            if task.is_windows { " • Windows/Microsoft" } else { "" }
                         ));
                         if !task.actions.is_empty() {
                             ui.small(egui::RichText::new(&task.actions).color(t.muted));
@@ -1300,24 +1443,202 @@ impl FaxinaApp {
     }
 
     fn page_services(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.hide_microsoft_services, "Ocultar serviços Microsoft (filtro por fabricante/caminho será refinado)");
-        if ui.button("Atualizar serviços").clicked() {
-            let cmd = if self.hide_microsoft_services {
-                "Get-CimInstance Win32_Service | Where-Object {$_.PathName -and $_.PathName -notmatch 'Windows\\\\System32'} | Select Name,State,StartMode,DisplayName,PathName | Format-Table -AutoSize | Out-String -Width 280"
-            } else {
-                "Get-CimInstance Win32_Service | Select Name,State,StartMode,DisplayName,PathName | Format-Table -AutoSize | Out-String -Width 280"
-            };
-            self.capture("Serviços", "powershell.exe", &["-NoProfile","-Command",cmd]);
-        }
-        ui.horizontal(|ui| {
-            ui.label("Nome do serviço:");
-            ui.text_edit_singleline(&mut self.service_name);
-            if ui.button("Iniciar").clicked() { self.elevated_cmd("Iniciar serviço", &format!("sc start \"{}\"", self.service_name.trim())); }
-            if ui.button("Parar").clicked() { self.elevated_cmd("Parar serviço", &format!("sc stop \"{}\"", self.service_name.trim())); }
-            if ui.button("Manual").clicked() { self.elevated_cmd("Serviço manual", &format!("sc config \"{}\" start= demand", self.service_name.trim())); }
-            if ui.button("Desativar").clicked() { self.elevated_cmd("Desativar serviço", &format!("sc config \"{}\" start= disabled", self.service_name.trim())); }
+        let t = themes()[self.theme_index].clone();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut self.hide_microsoft_services,
+                "Esconder serviços da Microsoft",
+            );
+            ui.checkbox(
+                &mut self.service_user_only,
+                "Somente serviços por usuário atual",
+            );
+            if ui.button("Atualizar serviços").clicked() {
+                self.services.scan();
+            }
+            if ui.button("Desmarcar todos").clicked() {
+                self.services.clear_selection();
+            }
         });
-        output_box(ui, &self.last_output);
+
+        ui.horizontal_wrapped(|ui| {
+            let has_visible_selected = self.services.items.iter().any(|service| {
+                service.checked
+                    && (!self.hide_microsoft_services || !service.is_microsoft)
+                    && (!self.service_user_only || service.is_current_user)
+            });
+            if ui
+                .add_enabled(has_visible_selected, egui::Button::new("Iniciar"))
+                .clicked()
+            {
+                self.services.apply_selected("start");
+            }
+            if ui
+                .add_enabled(has_visible_selected, egui::Button::new("Parar"))
+                .clicked()
+            {
+                self.services.apply_selected("stop");
+            }
+            if ui
+                .add_enabled(has_visible_selected, egui::Button::new("Automático"))
+                .clicked()
+            {
+                self.services.apply_selected("auto");
+            }
+            if ui
+                .add_enabled(has_visible_selected, egui::Button::new("Manual"))
+                .clicked()
+            {
+                self.services.apply_selected("manual");
+            }
+            if ui
+                .add_enabled(has_visible_selected, egui::Button::new("Desativar"))
+                .clicked()
+            {
+                self.services.apply_selected("disabled");
+            }
+        });
+
+        ui.label(&self.services.status);
+        ui.separator();
+
+        egui::CollapsingHeader::new("Instalar um serviço")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Nome:");
+                    ui.text_edit_singleline(&mut self.services.install_name);
+                    ui.label("Nome de exibição:");
+                    ui.text_edit_singleline(&mut self.services.install_display);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Executável:");
+                    ui.text_edit_singleline(&mut self.services.install_exe);
+                    if ui.button("Escolher .exe").clicked() {
+                        if let Some(path) = pick_file_dialog(
+                            "Executáveis (*.exe)|*.exe|Todos os arquivos (*.*)|*.*",
+                        ) {
+                            self.services.install_exe = path.to_string_lossy().to_string();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Argumentos:");
+                    ui.text_edit_singleline(&mut self.services.install_args);
+                    egui::ComboBox::from_label("Inicialização")
+                        .selected_text(match self.services.install_start {
+                            0 => "Automático",
+                            1 => "Manual",
+                            _ => "Desativado",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.services.install_start, 0, "Automático");
+                            ui.selectable_value(&mut self.services.install_start, 1, "Manual");
+                            ui.selectable_value(&mut self.services.install_start, 2, "Desativado");
+                        });
+                    egui::ComboBox::from_label("Conta")
+                        .selected_text(match self.services.install_account {
+                            1 => "LocalService",
+                            2 => "NetworkService",
+                            _ => "LocalSystem",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.services.install_account, 0, "LocalSystem");
+                            ui.selectable_value(&mut self.services.install_account, 1, "LocalService");
+                            ui.selectable_value(&mut self.services.install_account, 2, "NetworkService");
+                        });
+                    if ui.button("Instalar serviço").clicked() {
+                        self.services.install();
+                    }
+                });
+            });
+
+        let removable_selected = self.services.items.iter().any(|service| {
+            service.checked
+                && !service.is_microsoft
+                && (!self.service_user_only || service.is_current_user)
+        });
+        if ui
+            .add_enabled(
+                removable_selected,
+                egui::Button::new("Backup + remover serviços selecionados"),
+            )
+            .clicked()
+        {
+            let backup = portable_root()
+                .join("backups")
+                .join("services")
+                .join(timestamp_slug());
+            self.services.remove_selected(&backup);
+        }
+        ui.small("A remoção exporta a chave do serviço e grava um manifesto antes do sc delete. Serviços Microsoft/Windows são protegidos contra remoção.");
+
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for service in &mut self.services.items {
+                if self.hide_microsoft_services && service.is_microsoft {
+                    continue;
+                }
+                if self.service_user_only && !service.is_current_user {
+                    continue;
+                }
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut service.checked, "");
+                    ui.vertical(|ui| {
+                        ui.strong(format!(
+                            "{} ({})",
+                            service.display_name,
+                            service.name
+                        ));
+                        ui.small(format!(
+                            "{} • Inicialização: {} • Conta: {}",
+                            service.state,
+                            service.start_mode,
+                            service.start_name
+                        ));
+                        if !service.company.is_empty() {
+                            ui.small(format!("Fabricante: {}", service.company));
+                        }
+                        if !service.path_name.is_empty() {
+                            ui.small(
+                                egui::RichText::new(&service.path_name)
+                                    .color(t.muted),
+                            );
+                        }
+                        let mut tags = Vec::new();
+                        if service.is_microsoft {
+                            tags.push("Microsoft/Windows");
+                        } else {
+                            tags.push("Terceiro");
+                        }
+                        if service.is_per_user {
+                            tags.push("Serviço por usuário");
+                        }
+                        if service.is_current_user {
+                            tags.push("Usuário atual");
+                        }
+                        ui.small(
+                            egui::RichText::new(tags.join(" • "))
+                                .color(t.accent),
+                        );
+                        if let Some(error) = &service.error {
+                            ui.small(
+                                egui::RichText::new(format!("Falha: {error}"))
+                                    .color(t.accent),
+                            );
+                        }
+                    });
+                });
+                ui.separator();
+            }
+        });
+
+        if !self.services.output.trim().is_empty() {
+            egui::CollapsingHeader::new("Detalhes da última operação")
+                .show(ui, |ui| output_box(ui, &self.services.output));
+        }
     }
 
     fn page_shell(&mut self, ui: &mut egui::Ui) {
@@ -1858,6 +2179,23 @@ fn pick_folder_dialog() -> Option<PathBuf> {
     run_picker_script(script)
 }
 
+
+fn open_registry_editor() -> Result<(), String> {
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        "Start-Process -FilePath 'regedit.exe' -Verb RunAs",
+    ]);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
 
 fn open_default(path: &Path) {
     let quoted = path.to_string_lossy().replace('\'', "''");
