@@ -198,7 +198,7 @@ impl FaxinaApp {
         defrag.start_detect();
         let about_background = load_texture(&cc.egui_ctx, &root.join("assets").join("about-background.jpg"), "about-background");
         let about_creator = load_texture(&cc.egui_ctx, &root.join("assets").join("about-creator.jpg"), "about-creator");
-        let mut app = Self {
+        let app = Self {
             section: Section::Painel,
             theme_index: theme_index.min(themes().len() - 1),
             transparency,
@@ -361,12 +361,12 @@ impl FaxinaApp {
         let h = size * 0.48;
         let body = egui::Rect::from_center_size(c + egui::vec2(0.0, size*0.08), egui::vec2(w, h));
         p.rect_filled(body, 8.0, accent);
-        p.rect_stroke(body, 8.0, egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Inside);
+        p.rect_stroke(body, 8.0, egui::Stroke::new(2.0_f32, egui::Color32::WHITE), egui::StrokeKind::Inside);
         let top_y = body.top() - size*0.08;
         p.line_segment([egui::pos2(c.x-w*0.65, top_y), egui::pos2(c.x+w*0.65, top_y)], egui::Stroke::new(size*0.045, accent));
         p.line_segment([egui::pos2(c.x-w*0.18, top_y-size*0.08), egui::pos2(c.x+w*0.18, top_y-size*0.08)], egui::Stroke::new(size*0.045, accent));
         for f in [-0.23f32, 0.0, 0.23] {
-            p.line_segment([egui::pos2(c.x+w*f, body.top()+10.0), egui::pos2(c.x+w*f, body.bottom()-10.0)], egui::Stroke::new(2.0, egui::Color32::WHITE));
+            p.line_segment([egui::pos2(c.x+w*f, body.top()+10.0), egui::pos2(c.x+w*f, body.bottom()-10.0)], egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
         }
     }
 
@@ -1633,7 +1633,6 @@ impl FaxinaApp {
             if ui.button("Marcar serviços Windows conhecidos para Manual").clicked() {
                 self.services.mark_known_windows_manual();
                 self.hide_microsoft_services = false;
-                self.service_user_only = false;
             }
             if ui.button("Desmarcar todos").clicked() {
                 self.services.clear_selection();
