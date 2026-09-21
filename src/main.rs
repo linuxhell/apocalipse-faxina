@@ -1180,13 +1180,43 @@ impl FaxinaApp {
                     ));
                 });
                 ui.add_space(5.0);
-                ui.strong("Mapa proporcional após a última medição");
-                draw_fragmentation_map(ui, current, t.accent);
+                let live_map = self.defrag.running
+                    && self.defrag.current_drive.eq_ignore_ascii_case(&report.drive)
+                    && after.is_none();
+                let live_progress = if live_map {
+                    self.defrag.current_drive_progress
+                } else {
+                    0.0
+                };
+                let animation_time = ui.ctx().input(|input| input.time as f32);
+                if live_map {
+                    ui.strong(format!(
+                        "Mapa proporcional em tempo real • progresso da unidade {:.0}%",
+                        live_progress
+                    ));
+                } else {
+                    ui.strong("Mapa proporcional após a última medição");
+                }
+                draw_fragmentation_map(
+                    ui,
+                    current,
+                    t.accent,
+                    live_map,
+                    live_progress,
+                    animation_time,
+                );
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("■ Fragmentado").color(egui::Color32::from_rgb(220,55,55)));
                     ui.label(egui::RichText::new("■ Alocado").color(t.accent));
                     ui.label("Espaço livre = sem bloco");
                 });
+                if live_map {
+                    ui.small("Durante a operação, os blocos vermelhos se deslocam e diminuem conforme o defrag.exe reporta progresso. O resultado real é confirmado pela medição final do Windows.");
+                } else if current.fragmentation_percent.unwrap_or(0.0) <= 0.0
+                    && current.fragmented_files.unwrap_or(0) > 0
+                {
+                    ui.small("O Windows arredondou a fragmentação para 0,0%, mas ainda relatou arquivos fragmentados; o mapa mostra um bloco vermelho mínimo apenas para indicar essa condição.");
+                }
 
                 ui.add_space(5.0);
                 egui::Grid::new(format!("drive_report_{}", report.drive))
@@ -1227,26 +1257,6 @@ impl FaxinaApp {
             });
         }
 
-        if !self.defrag.output.trim().is_empty() {
-            egui::CollapsingHeader::new("Prévia do log técnico do defrag.exe")
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.small("Use “Abrir log técnico” para ver o conteúdo completo em uma janela independente com rolagem própria.");
-                    egui::ScrollArea::vertical()
-                        .id_salt("defrag_log_preview")
-                        .max_height(180.0)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(&mut self.defrag.output.clone())
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(8)
-                                    .interactive(false),
-                            );
-                        });
-                });
-        }
-    
             });
 
         if self.defrag.show_log {
@@ -3259,6 +3269,9 @@ fn draw_fragmentation_map(
     ui: &mut egui::Ui,
     snapshot: &defrag::Snapshot,
     allocated_color: egui::Color32,
+    live: bool,
+    live_progress: f32,
+    animation_time: f32,
 ) {
     let columns = 48usize;
     let rows = 7usize;
@@ -3269,7 +3282,10 @@ fn draw_fragmentation_map(
         .clamp(3.0, 13.0);
     let height = rows as f32 * cell + gap * (rows.saturating_sub(1) as f32);
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(columns as f32 * cell + gap * (columns.saturating_sub(1) as f32), height),
+        egui::vec2(
+            columns as f32 * cell + gap * (columns.saturating_sub(1) as f32),
+            height,
+        ),
         egui::Sense::hover(),
     );
 
@@ -3280,13 +3296,46 @@ fn draw_fragmentation_map(
     }
     .clamp(0.0, 1.0);
     let used_cells = ((count as f64 * used_ratio).round() as usize).min(count);
+
     let frag_ratio = snapshot
         .fragmentation_percent
         .unwrap_or(0.0)
         .clamp(0.0, 100.0) as f64
         / 100.0;
-    let fragmented_cells =
+    let mut measured_fragmented =
         ((used_cells as f64 * frag_ratio).round() as usize).min(used_cells);
+
+    // O defrag.exe pode arredondar a fragmentação para 0,0% mesmo relatando
+    // arquivos fragmentados. Nesse caso exibimos somente um bloco vermelho
+    // mínimo para indicar a condição sem inventar uma porcentagem.
+    if measured_fragmented == 0
+        && used_cells > 0
+        && snapshot.fragmented_files.unwrap_or(0) > 0
+    {
+        measured_fragmented = 1;
+    }
+
+    let optimization_progress = if live {
+        ((live_progress - 8.0) / 74.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let fragmented_cells = if live && measured_fragmented > 0 {
+        ((measured_fragmented as f32 * (1.0 - optimization_progress)).ceil() as usize)
+            .min(measured_fragmented)
+    } else {
+        measured_fragmented
+    };
+
+    // O deslocamento é puramente visual e é movido pelo relógio da UI.
+    // A quantidade de vermelho, porém, acompanha o progresso real reportado
+    // pelo defrag.exe para a unidade atual.
+    let shift = if live && used_cells > 0 && live_progress >= 8.0 && live_progress < 90.0 {
+        ((animation_time * 6.0) as usize) % used_cells
+    } else {
+        0
+    };
 
     for index in 0..used_cells {
         let row = index / columns;
@@ -3297,11 +3346,17 @@ fn draw_fragmentation_map(
         );
         let cell_rect = egui::Rect::from_min_size(min, egui::vec2(cell, cell));
 
-        // Espalha os blocos fragmentados proporcionalmente pelo espaço usado
-        // para evitar sugerir uma posição física que o defrag.exe não informa.
-        let red = fragmented_cells > 0
-            && ((index.wrapping_mul(97).wrapping_add(31)) % used_cells.max(1))
-                < fragmented_cells;
+        let rank = if used_cells > 0 {
+            index
+                .wrapping_mul(97)
+                .wrapping_add(31)
+                .wrapping_add(shift.wrapping_mul(17))
+                % used_cells
+        } else {
+            0
+        };
+        let red = fragmented_cells > 0 && rank < fragmented_cells;
+
         let color = if red {
             egui::Color32::from_rgb(220, 55, 55)
         } else {
