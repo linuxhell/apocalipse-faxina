@@ -34,7 +34,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\config | Out-Null
           New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\backups | Out-Null
           New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\logs | Out-Null
-          Set-Content -Encoding UTF8 dist\Apocalipse-Faxina\data\LEIA-ME.txt "Coloque winapp2.ini nesta pasta para carregar as regras Winapp2."
+          New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\assets | Out-Null
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/linuxhell/apocalipse-download-manager/main/apps/desktop/src-tauri/assets/about-background.jpg" -OutFile dist\Apocalipse-Faxina\assets\about-background.jpg
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/linuxhell/apocalipse-download-manager/main/apps/desktop/src-tauri/assets/about-creator.jpg" -OutFile dist\Apocalipse-Faxina\assets\about-creator.jpg
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/linuxhell/apocalipse-download-manager/main/apps/desktop/src-tauri/assets/about-theme.mp4" -OutFile dist\Apocalipse-Faxina\assets\about-theme.mp4
+          if ((Get-Item dist\Apocalipse-Faxina\assets\about-theme.mp4).Length -lt 100000) { throw "Falha ao obter a musica da secao Sobre" }
+          Set-Content -Encoding UTF8 dist\Apocalipse-Faxina\data\LEIA-ME.txt "Coloque winapp2.ini nesta pasta para carregar as regras Winapp2, ou selecione outro arquivo dentro do programa."
 
       - name: Artefato Windows x64 portátil
         uses: actions/upload-artifact@v4
