@@ -3,6 +3,9 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     process::{Command, Stdio},
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::Instant,
 };
 
 #[cfg(windows)]
@@ -88,85 +91,31 @@ pub struct DriverState {
     pub items: Vec<DriverEntry>,
     pub status: String,
     pub output: String,
+    pub scanning: bool,
+    scan_rx: Option<Receiver<Result<Vec<DriverEntry>, String>>>,
+    scan_started: Option<Instant>,
+    pending_errors: HashMap<String, String>,
 }
 
 impl DriverState {
     pub fn scan(&mut self) {
-        const SCRIPT: &str = r#"
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$deviceMap = @{}
-Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | ForEach-Object {
-  $inf = [string]$_.InfName
-  if([string]::IsNullOrWhiteSpace($inf)){ return }
-  $key = $inf.ToLowerInvariant()
-  if(-not $deviceMap.ContainsKey($key)){ $deviceMap[$key] = @() }
-  if(-not [string]::IsNullOrWhiteSpace([string]$_.DeviceName)){
-    $deviceMap[$key] += [string]$_.DeviceName
-  }
-}
-
-$items = @(
-  Get-WindowsDriver -Online -All -ErrorAction SilentlyContinue |
-    Where-Object { [string]$_.Driver -match '^oem\d+\.inf$' } |
-    ForEach-Object {
-      $inf = [string]$_.Driver
-      $original = [string]$_.OriginalFileName
-      $dir = if($original){ Split-Path -Parent $original } else { '' }
-      $size = 0L
-      $storeDate = ''
-      if($dir -and (Test-Path -LiteralPath $dir)){
-        try {
-          $size = [int64]((Get-ChildItem -LiteralPath $dir -File -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum)
-          $storeDate = (Get-Item -LiteralPath $dir -ErrorAction SilentlyContinue).LastWriteTime.ToString('yyyy-MM-dd')
-        } catch {}
-      }
-      $date = ''
-      try { if($_.Date){ $date = ([datetime]$_.Date).ToString('yyyy-MM-dd') } } catch { $date = [string]$_.Date }
-      $key = $inf.ToLowerInvariant()
-      $devices = if($deviceMap.ContainsKey($key)){ @($deviceMap[$key] | Select-Object -Unique) -join ' | ' } else { '' }
-      [PSCustomObject]@{
-        PublishedName = $inf
-        OriginalInf = if($original){ [IO.Path]::GetFileName($original) } else { '' }
-        ClassName = [string]$_.ClassName
-        ProviderName = [string]$_.ProviderName
-        Version = [string]$_.Version
-        Date = $date
-        StoreDate = $storeDate
-        Size = [int64]$size
-        Devices = [string]$devices
-        Active = [bool]$deviceMap.ContainsKey($key)
-        Inbox = [bool]$_.Inbox
-        BootCritical = [bool]$_.BootCritical
-      }
+        if self.scanning{return;}
+        let (tx,rx)=mpsc::channel();self.scan_rx=Some(rx);self.scanning=true;self.scan_started=Some(Instant::now());
+        self.status="Analisando Driver Store em segundo plano…".into();self.output.clear();
+        crate::diagnostics::operation_start("drivers","scan",serde_json::json!({}));
+        thread::spawn(move||{let _=tx.send(scan_driver_store());});
     }
-)
-[Console]::Write((ConvertTo-Json -InputObject $items -Compress -Depth 5))
-"#;
-
-        match run_json::<DriverEntry>(SCRIPT) {
-            Ok(mut items) => {
-                classify_old_candidates(&mut items);
-                items.sort_by(|a, b| {
-                    a.category()
-                        .cmp(b.category())
-                        .then_with(|| a.provider_name.cmp(&b.provider_name))
-                        .then_with(|| a.published_name.cmp(&b.published_name))
-                });
-                let old = items.iter().filter(|x| x.old_candidate).count();
-                let active = items.iter().filter(|x| x.active).count();
-                self.status = format!(
-                    "{} pacotes no Driver Store • {} em uso • {} versão(ões) antiga(s) candidata(s)",
-                    items.len(),
-                    active,
-                    old
-                );
-                self.items = items;
-                self.output.clear();
-            }
-            Err(error) => {
-                self.status = "Falha ao analisar Driver Store.".into();
-                self.output = error;
-            }
+    pub fn poll(&mut self){
+        let result=self.scan_rx.as_ref().and_then(|rx|rx.try_recv().ok());let Some(result)=result else{return;};
+        self.scan_rx=None;self.scanning=false;let elapsed=self.scan_started.take().map(|x|x.elapsed().as_millis()).unwrap_or(0);
+        match result{
+            Ok(mut items)=>{classify_old_candidates(&mut items);items.sort_by(|a,b|a.category().cmp(b.category()).then_with(||a.provider_name.cmp(&b.provider_name)).then_with(||a.published_name.cmp(&b.published_name)));
+                for item in &mut items{if let Some(e)=self.pending_errors.get(&item.published_name){item.error=Some(e.clone());item.checked=true;}}
+                let old=items.iter().filter(|x|x.old_candidate).count();let active=items.iter().filter(|x|x.active).count();
+                self.status=format!("{} pacotes no Driver Store • {} em uso • {} versão(ões) antiga(s) candidata(s)",items.len(),active,old);
+                crate::diagnostics::operation_end("drivers","scan",true,elapsed,serde_json::json!({"packages":items.len(),"active":active,"old_candidates":old}));
+                self.items=items;self.pending_errors.clear();}
+            Err(error)=>{self.status="Falha ao analisar Driver Store.".into();self.output=error.clone();crate::diagnostics::operation_end("drivers","scan",false,elapsed,serde_json::json!({"error":error}));}
         }
     }
 
@@ -247,21 +196,66 @@ $items = @(
             }
         }
 
+        self.pending_errors=failures.clone();
+        self.output=logs.join("\n\n");
+        self.status=format!("{} driver(s) removidos • {} falha(s); atualizando Driver Store…{}",removed,failures.len(),if force{" após tentativa forçada"}else{""});
         self.scan();
-        for item in &mut self.items {
-            if let Some(error) = failures.get(&item.published_name) {
-                item.error = Some(error.clone());
-                item.checked = true;
-            }
-        }
-        self.output = logs.join("\n\n");
-        self.status = format!(
-            "{} driver(s) removidos • {} falha(s) permanecem marcadas{}",
-            removed,
-            failures.len(),
-            if force { " após tentativa forçada" } else { "" }
-        );
     }
+}
+
+fn scan_driver_store()->Result<Vec<DriverEntry>,String>{
+    const SCRIPT: &str = r#"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$deviceMap = @{}
+Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | ForEach-Object {
+  $inf = [string]$_.InfName
+  if([string]::IsNullOrWhiteSpace($inf)){ return }
+  $key = $inf.ToLowerInvariant()
+  if(-not $deviceMap.ContainsKey($key)){ $deviceMap[$key] = @() }
+  if(-not [string]::IsNullOrWhiteSpace([string]$_.DeviceName)){
+    $deviceMap[$key] += [string]$_.DeviceName
+  }
+}
+
+$items = @(
+  Get-WindowsDriver -Online -All -ErrorAction SilentlyContinue |
+    Where-Object { [string]$_.Driver -match '^oem\d+\.inf$' } |
+    ForEach-Object {
+      $inf = [string]$_.Driver
+      $original = [string]$_.OriginalFileName
+      $dir = if($original){ Split-Path -Parent $original } else { '' }
+      $size = 0L
+      $storeDate = ''
+      if($dir -and (Test-Path -LiteralPath $dir)){
+    try {
+      $size = [int64]((Get-ChildItem -LiteralPath $dir -File -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum)
+      $storeDate = (Get-Item -LiteralPath $dir -ErrorAction SilentlyContinue).LastWriteTime.ToString('yyyy-MM-dd')
+    } catch {}
+      }
+      $date = ''
+      try { if($_.Date){ $date = ([datetime]$_.Date).ToString('yyyy-MM-dd') } } catch { $date = [string]$_.Date }
+      $key = $inf.ToLowerInvariant()
+      $devices = if($deviceMap.ContainsKey($key)){ @($deviceMap[$key] | Select-Object -Unique) -join ' | ' } else { '' }
+      [PSCustomObject]@{
+    PublishedName = $inf
+    OriginalInf = if($original){ [IO.Path]::GetFileName($original) } else { '' }
+    ClassName = [string]$_.ClassName
+    ProviderName = [string]$_.ProviderName
+    Version = [string]$_.Version
+    Date = $date
+    StoreDate = $storeDate
+    Size = [int64]$size
+    Devices = [string]$devices
+    Active = [bool]$deviceMap.ContainsKey($key)
+    Inbox = [bool]$_.Inbox
+    BootCritical = [bool]$_.BootCritical
+      }
+    }
+)
+[Console]::Write((ConvertTo-Json -InputObject $items -Compress -Depth 5))
+"#;
+
+    run_json::<DriverEntry>(SCRIPT)
 }
 
 fn classify_old_candidates(items: &mut [DriverEntry]) {

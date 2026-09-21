@@ -31,5 +31,5 @@ winresource = "0.1"
 opt-level = "z"
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = "symbols"

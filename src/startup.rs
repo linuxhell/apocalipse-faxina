@@ -25,6 +25,8 @@ pub struct StartupEntry {
     pub enabled: bool,
     #[serde(skip)]
     pub checked: bool,
+    #[serde(skip)]
+    pub optimization_reason: Option<String>,
 }
 
 #[derive(Default)]
@@ -168,6 +170,18 @@ foreach ($root in $folderRoots) {
             }
             Err(error) => self.status = error,
         }
+    }
+
+    pub fn mark_known_for_optimization(&mut self) -> usize {
+        let mut count=0usize;
+        for entry in &mut self.entries {
+            entry.checked=false;
+            entry.optimization_reason=crate::optimizer_db::startup_reason(&entry.name,&entry.command,&entry.company).map(str::to_string);
+            if entry.enabled && entry.optimization_reason.is_some(){entry.checked=true;count+=1;}
+        }
+        self.status=format!("{} programa(s) conhecidos marcados como opcionais no logon. Revise antes de desativar.",count);
+        crate::diagnostics::event("optimization_selection","Programas conhecidos marcados",serde_json::json!({"count":count,"db_version":crate::optimizer_db::DB_VERSION}));
+        count
     }
 
     pub fn set_all_checked(&mut self, checked: bool) {

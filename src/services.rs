@@ -34,8 +34,12 @@ pub struct ServiceEntry {
     pub is_per_user: bool,
     #[serde(rename = "IsCurrentUser", default)]
     pub is_current_user: bool,
+    #[serde(rename = "HasTrigger", default)]
+    pub has_trigger: bool,
     #[serde(skip)]
     pub checked: bool,
+    #[serde(skip)]
+    pub optimization_reason: Option<String>,
     #[serde(skip)]
     pub error: Option<String>,
 }
@@ -87,6 +91,8 @@ $items = @(
     }
     if([string]$_.Name -match '_[0-9A-Fa-f]{5,}$'){ $perUser = $true }
     $isMicrosoft = ($company -match '(?i)Microsoft') -or ($exe -match '(?i)\\Windows\\(System32|SysWOW64)\\')
+    $triggerPath = "HKLM:\SYSTEM\CurrentControlSet\Services\" + [string]$_.Name + "\TriggerInfo"
+    $hasTrigger = Test-Path -LiteralPath $triggerPath
     $isCurrent = $perUser -and (
       ([string]$_.StartName -eq $currentUser) -or
       ([string]$_.StartName -match '(?i)LocalSystem|LocalService|NetworkService')
@@ -102,6 +108,7 @@ $items = @(
       IsMicrosoft = [bool]$isMicrosoft
       IsPerUser = [bool]$perUser
       IsCurrentUser = [bool]$isCurrent
+      HasTrigger = [bool]$hasTrigger
     }
   }
 )
@@ -136,6 +143,18 @@ $items = @(
                 self.output = error;
             }
         }
+    }
+
+    pub fn mark_known_windows_manual(&mut self)->usize{
+        let mut count=0usize;
+        for item in &mut self.items{
+            item.checked=false;
+            item.optimization_reason=crate::optimizer_db::service_manual_reason(&item.name,item.is_microsoft,&item.start_mode,item.has_trigger).map(str::to_string);
+            if item.optimization_reason.is_some(){item.checked=true;count+=1;}
+        }
+        self.status=format!("{} serviço(s) Windows conhecido(s) marcados para Manual. O preset nunca desativa serviços.",count);
+        crate::diagnostics::event("optimization_selection","Serviços conhecidos marcados para Manual",serde_json::json!({"count":count,"db_version":crate::optimizer_db::DB_VERSION}));
+        count
     }
 
     pub fn clear_selection(&mut self) {
