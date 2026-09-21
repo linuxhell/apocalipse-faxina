@@ -69,9 +69,23 @@ fn make_icon(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 fn main() {
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let source_audio = manifest_dir.join("assets").join("about-theme.mp3");
+    let embedded_audio = out.join("about-theme.mp3");
+
+    println!("cargo:rerun-if-changed={}", source_audio.display());
+    if source_audio.is_file() {
+        fs::copy(&source_audio, &embedded_audio)
+            .expect("falha ao copiar about-theme.mp3 para recurso embutido");
+    } else {
+        fs::write(&embedded_audio, [])
+            .expect("falha ao criar placeholder do audio embutido");
+        println!("cargo:warning=about-theme.mp3 ausente; build sera gerado sem trilha embutida");
+    }
+
     #[cfg(windows)]
     {
-        let out = PathBuf::from(env::var("OUT_DIR").unwrap());
         let icon = out.join("apocalipse-faxina.ico");
         make_icon(&icon).expect("falha ao gerar icone");
         let mut res = winresource::WindowsResource::new();

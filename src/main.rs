@@ -19,7 +19,7 @@ use std::{
     collections::HashMap,
     env,
     fs,
-    io::BufReader,
+    io::Cursor,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -29,6 +29,8 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+const ABOUT_THEME_MP3: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/about-theme.mp3"));
 
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -185,7 +187,8 @@ struct FaxinaApp {
     about_audio: Option<AboutAudio>,
     about_volume: f32,
     diagnostic_export: diagnostics::ExportState,
-    startup_opacity_pending: bool,
+    startup_opacity_retries: u8,
+    startup_opacity_last_apply: Option<std::time::Instant>,
 }
 
 impl FaxinaApp {
@@ -231,10 +234,10 @@ impl FaxinaApp {
             about_audio: None,
             about_volume: 0.70,
             diagnostic_export: diagnostics::ExportState::default(),
-            startup_opacity_pending: true,
+            startup_opacity_retries: 18,
+            startup_opacity_last_apply: None,
         };
         app.apply_theme(&cc.egui_ctx);
-        set_window_opacity(app.transparency);
         app
     }
 
@@ -2264,33 +2267,35 @@ impl FaxinaApp {
 
     fn restart_about_audio(&mut self) {
         self.stop_about_audio();
-        let path = portable_root().join("assets").join("about-theme.mp3");
 
         diagnostics::event(
             "about_audio",
-            "Iniciando áudio da seção Sobre pelo backend Rust/WASAPI",
+            "Iniciando áudio embutido da seção Sobre",
             serde_json::json!({
-                "path": path.to_string_lossy(),
-                "exists": path.is_file(),
-                "backend": "rodio/cpal/WASAPI"
+                "embedded_bytes": ABOUT_THEME_MP3.len(),
+                "backend": "rodio/cpal/WASAPI",
+                "source": "include_bytes"
             }),
         );
 
-        match start_about_audio(&path, self.about_volume) {
+        match start_about_audio(self.about_volume) {
             Ok(audio) => {
                 self.about_audio = Some(audio);
                 self.last_output.clear();
                 diagnostics::event(
                     "about_audio",
-                    "Áudio iniciado com backend portátil",
-                    serde_json::json!({"backend": "rodio/cpal/WASAPI"}),
+                    "Áudio embutido iniciado",
+                    serde_json::json!({
+                        "backend": "rodio/cpal/WASAPI",
+                        "embedded_bytes": ABOUT_THEME_MP3.len()
+                    }),
                 );
             }
             Err(error) => {
                 self.last_output = error.clone();
                 diagnostics::event(
                     "about_audio_error",
-                    "Falha ao iniciar áudio portátil",
+                    "Falha ao iniciar áudio embutido",
                     serde_json::json!({"error": error}),
                 );
             }
@@ -2335,10 +2340,6 @@ impl eframe::App for FaxinaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_started=std::time::Instant::now();
         self.apply_theme(ctx);
-        if self.startup_opacity_pending {
-            set_window_opacity(self.transparency);
-            self.startup_opacity_pending = false;
-        }
         let t = themes()[self.theme_index].clone();
         let section_before_nav = self.section;
         egui::SidePanel::left("nav").exact_width(235.0).frame(egui::Frame::new().fill(t.panel).inner_margin(egui::Margin::same(12))).show(ctx, |ui| {
@@ -2399,6 +2400,30 @@ impl eframe::App for FaxinaApp {
         });
         let click=ctx.input(|input|if input.pointer.any_click(){input.pointer.interact_pos().map(|p|(p.x,p.y,input.pointer.secondary_clicked()))}else{None});
         if let Some((x,y,secondary))=click{diagnostics::ui_click(self.section.title(),x,y,secondary);}
+
+        if self.startup_opacity_retries > 0 {
+            let should_apply = self
+                .startup_opacity_last_apply
+                .map(|last| last.elapsed() >= std::time::Duration::from_millis(160))
+                .unwrap_or(true);
+
+            if should_apply {
+                set_window_opacity(self.transparency);
+                self.startup_opacity_last_apply = Some(std::time::Instant::now());
+                self.startup_opacity_retries = self.startup_opacity_retries.saturating_sub(1);
+            }
+
+            if self.startup_opacity_retries > 0 {
+                ctx.request_repaint_after(std::time::Duration::from_millis(170));
+            } else {
+                diagnostics::event(
+                    "appearance_opacity_stabilized",
+                    "Transparência reaplicada após estabilização da janela",
+                    serde_json::json!({"transparency": self.transparency}),
+                );
+            }
+        }
+
         diagnostics::frame_finished(self.section.title(),frame_started.elapsed().as_millis());
     }
 }
@@ -2449,22 +2474,20 @@ impl Drop for AboutAudio {
     }
 }
 
-fn start_about_audio(path: &Path, volume: f32) -> Result<AboutAudio, String> {
-    if !path.is_file() {
-        return Err(format!(
-            "Áudio portátil não encontrado: {}. Extraia o ZIP completo do Faxina para uma pasta nova; não substitua apenas o EXE.",
-            path.display()
-        ));
+fn start_about_audio(volume: f32) -> Result<AboutAudio, String> {
+    if ABOUT_THEME_MP3.is_empty() {
+        return Err(
+            "A trilha da seção Sobre não foi incorporada ao executável durante a compilação."
+                .to_string(),
+        );
     }
 
-    let file = fs::File::open(path)
-        .map_err(|error| format!("Falha ao abrir {}: {error}", path.display()))?;
-    let source = rodio::Decoder::new(BufReader::new(file))
-        .map_err(|error| format!("Falha ao decodificar MP3 embutido: {error}"))?;
+    let source = rodio::Decoder::new(Cursor::new(ABOUT_THEME_MP3))
+        .map_err(|error| format!("Falha ao decodificar a trilha MP3 embutida: {error}"))?;
 
     let (stream, handle) = rodio::OutputStream::try_default()
         .map_err(|error| format!(
-            "Falha ao abrir a saída de áudio do Windows via WASAPI: {error}. O Faxina não depende do Windows Media Player."
+            "Falha ao abrir a saída de áudio do Windows via WASAPI: {error}. O Faxina não depende do Windows Media Player nem do VLC."
         ))?;
     let sink = rodio::Sink::try_new(&handle)
         .map_err(|error| format!("Falha ao criar o canal de reprodução: {error}"))?;
