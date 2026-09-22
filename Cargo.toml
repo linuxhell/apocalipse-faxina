@@ -1,6 +1,6 @@
 [package]
 name = "apocalipse-faxina"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["linuxhell"]
 description = "Apocalipse Faxina - manutenção e limpeza portátil para Windows x64"
