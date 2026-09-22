@@ -7,6 +7,9 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: write
+
 jobs:
   windows-x64:
     runs-on: windows-latest
@@ -64,3 +67,49 @@ jobs:
           name: Apocalipse-Faxina-Windows-x64
           path: dist/Apocalipse-Faxina/
           if-no-files-found: error
+
+      - name: Preparar ZIP do release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          $zip = "Apocalipse-Faxina-Windows-x64-v0.2.0.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path dist\Apocalipse-Faxina -DestinationPath $zip -CompressionLevel Optimal
+
+      - name: Publicar GitHub Release v0.2.0
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view v0.2.0 --repo "$env:GITHUB_REPOSITORY" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release v0.2.0 ja existe; nenhuma nova publicacao necessaria."
+            exit 0
+          }
+
+          @"
+          Primeira versão pública do Apocalipse Faxina, utilitário portátil de manutenção, limpeza, diagnóstico e otimização para Windows x64, com foco em análise antes da ação, exclusões globais, backups e operações reversíveis sempre que possível.
+
+          Destaques:
+          - Limpeza segura com análise antes da remoção.
+          - Exclusões globais que prevalecem sobre as regras de limpeza.
+          - Proteções padrão para caminhos críticos usados por impressão no Windows.
+          - Resíduos profundos e localizador de arquivos duplicados.
+          - Integração Winapp2.ini com perfil persistente e preset seguro.
+          - Navegadores portáteis: Chrome, Edge e Firefox.
+          - Thunderbird Portable.
+          - Limpeza de Python / desenvolvimento.
+          - WinSxS usando mecanismos oficiais do Windows.
+          - Discos/SSD com múltiplos modos de otimização e relatórios antes/depois.
+          - Gerenciamento de Driver Store.
+          - Safe Scan do Registro com backup.
+          - Inicialização, tarefas agendadas, serviços e menu de contexto.
+          - Reparo do Windows e da Internet com diagnóstico e backup de rede.
+          - Sistema de diagnóstico/debug estruturado.
+          - Seção Sobre com mídia e áudio embutido.
+          - Faxina Uninstaller.
+          - Link de doação PayPal.
+          "@ | Set-Content -Encoding UTF8 release-notes.md
+
+          gh release create v0.2.0 "Apocalipse-Faxina-Windows-x64-v0.2.0.zip" --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" --title "Apocalipse Faxina v0.2.0" --notes-file release-notes.md
