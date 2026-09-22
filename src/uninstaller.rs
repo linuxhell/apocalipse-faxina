@@ -76,6 +76,8 @@ pub struct InstalledProgram {
 pub struct WindowsApp {
     #[serde(rename = "Name", default)]
     pub name: String,
+    #[serde(rename = "DisplayName", default)]
+    pub display_name: String,
     #[serde(rename = "PackageFullName", default)]
     pub package_full_name: String,
     #[serde(rename = "Version", default)]
@@ -655,7 +657,11 @@ impl UninstallerState {
                 );
             }
             Ok(WorkerOutput::Apps(mut apps)) => {
-                apps.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+                apps.sort_by(|a, b| {
+                    let a_name = if a.display_name.is_empty() { &a.name } else { &a.display_name };
+                    let b_name = if b.display_name.is_empty() { &b.name } else { &b.display_name };
+                    a_name.to_ascii_lowercase().cmp(&b_name.to_ascii_lowercase())
+                });
                 let count = apps.len();
                 self.apps = apps;
                 self.status = format!("{} Windows App(s) removível(eis)/visível(eis).", count);
@@ -891,17 +897,46 @@ $json=foreach($item in @($items)){ConvertTo-Json -InputObject $item -Compress -D
 fn scan_windows_apps() -> Result<Vec<WindowsApp>, String> {
     const SCRIPT: &str = r#"
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
-$items=Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { $_.Name -and -not $_.IsResourcePackage } | ForEach-Object {
- [PSCustomObject]@{
-  Name=[string]$_.Name
-  PackageFullName=[string]$_.PackageFullName
-  Version=[string]$_.Version
-  Publisher=[string]$_.Publisher
-  InstallLocation=[string]$_.InstallLocation
-  NonRemovable=[bool]$_.NonRemovable
-  IsFramework=[bool]$_.IsFramework
+
+# O modo amigável cruza os pacotes instalados com os apps realmente
+# expostos ao usuário no Menu Iniciar. Isso esconde runtimes/dependências
+# que não são aplicativos que uma pessoa normalmente escolheria remover.
+$startByFamily=@{}
+Get-StartApps -ErrorAction SilentlyContinue | ForEach-Object {
+ $appId=[string]$_.AppID
+ if($appId -match '^([^!]+)!'){
+  $family=$matches[1]
+  if(-not $startByFamily.ContainsKey($family)){
+   $startByFamily[$family]=[string]$_.Name
+  }
  }
 }
+
+$blocked='^(Microsoft\.(VCLibs|NET\.Native|UI\.Xaml|WindowsAppRuntime|WinUI|Services\.Store\.Engagement|StorePurchaseApp|AAD\.BrokerPlugin|AccountsControl|LockApp|Win32WebViewHost|Windows\.ShellExperienceHost|Windows\.StartMenuExperienceHost|Windows\.CloudExperienceHost|Windows\.ContentDeliveryManager|Windows\.Search|SecHealthUI)|MicrosoftWindows\.(Client\.|SharedRuntime|CrossDevice))'
+
+$items=Get-AppxPackage -ErrorAction SilentlyContinue |
+ Where-Object {
+  $_.Name -and
+  -not $_.IsResourcePackage -and
+  -not $_.IsFramework -and
+  -not $_.NonRemovable -and
+  ([string]$_.Name -notmatch $blocked) -and
+  $startByFamily.ContainsKey([string]$_.PackageFamilyName)
+ } |
+ ForEach-Object {
+  $friendly=[string]$startByFamily[[string]$_.PackageFamilyName]
+  [PSCustomObject]@{
+   Name=[string]$_.Name
+   DisplayName=if([string]::IsNullOrWhiteSpace($friendly)){[string]$_.Name}else{$friendly}
+   PackageFullName=[string]$_.PackageFullName
+   Version=[string]$_.Version
+   Publisher=[string]$_.Publisher
+   InstallLocation=[string]$_.InstallLocation
+   NonRemovable=[bool]$_.NonRemovable
+   IsFramework=[bool]$_.IsFramework
+  }
+ }
+
 $json=foreach($item in @($items)){ConvertTo-Json -InputObject $item -Compress -Depth 4}
 [Console]::Write('['+($json -join ',')+']')
 "#;

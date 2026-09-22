@@ -1636,7 +1636,7 @@ impl FaxinaApp {
             }
             uninstaller::UninstallerTab::WindowsApps => {
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("Atualizar Windows Apps").clicked() {
+                    if ui.button("Atualizar apps amigáveis").clicked() {
                         self.uninstaller.start_refresh_apps();
                     }
                     if ui
@@ -1654,7 +1654,7 @@ impl FaxinaApp {
                         }
                     }
                 });
-                ui.small("Frameworks e pacotes marcados pelo Windows como não removíveis permanecem protegidos.");
+                ui.small("Modo amigável/seguro: mostra somente aplicativos removíveis expostos ao usuário no Menu Iniciar. Frameworks, runtimes, dependências, pacotes de recursos e componentes essenciais ficam ocultos.");
                 egui::ScrollArea::vertical()
                     .id_salt("uninstaller_appx")
                     .show(ui, |ui| {
@@ -1665,8 +1665,19 @@ impl FaxinaApp {
                                     ui.checkbox(&mut app.checked, "");
                                 });
                                 ui.vertical(|ui| {
-                                    ui.strong(&app.name);
+                                    let friendly = if app.display_name.is_empty() {
+                                        &app.name
+                                    } else {
+                                        &app.display_name
+                                    };
+                                    ui.strong(friendly);
                                     ui.small(format!("{} • {}", app.version, app.publisher));
+                                    if friendly != &app.name {
+                                        ui.small(
+                                            egui::RichText::new(format!("Pacote: {}", app.name))
+                                                .color(t.muted),
+                                        );
+                                    }
                                     if app.non_removable || app.is_framework {
                                         ui.small(
                                             egui::RichText::new("Protegido pelo Windows/Faxina")
@@ -1766,12 +1777,12 @@ impl FaxinaApp {
             }
             uninstaller::UninstallerTab::Monitor => {
                 ui.label("Instalação monitorada");
-                ui.small("1) Antes de instalar, crie o snapshot. 2) Instale o programa normalmente. 3) Compare. O Faxina registra novas entradas Uninstall e novos diretórios-base para facilitar uma remoção futura.");
+                ui.small("Etapa 1: crie o snapshot. Depois instale o programa normalmente. Etapa 2: compare o sistema após a instalação. O Faxina registra novas entradas Uninstall e novos diretórios-base para facilitar uma remoção futura.");
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
                             !self.uninstaller.busy,
-                            egui::Button::new("1. Criar snapshot antes"),
+                            egui::Button::new("Etapa 1: Criar snapshot antes"),
                         )
                         .clicked()
                     {
@@ -1780,7 +1791,7 @@ impl FaxinaApp {
                     if ui
                         .add_enabled(
                             !self.uninstaller.busy,
-                            egui::Button::new("3. Comparar depois da instalação"),
+                            egui::Button::new("Etapa 2: Comparar depois da instalação"),
                         )
                         .clicked()
                     {
