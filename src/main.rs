@@ -3164,6 +3164,7 @@ fn normalize_drive_target(value: &str) -> Option<String> {
 
 #[cfg(windows)]
 fn run_picker_script(script: &str) -> Option<PathBuf> {
+    diagnostics::suppress_next_ui_stall();
     let mut command = Command::new("powershell.exe");
     command.args(["-NoProfile", "-STA", "-Command", script]);
     command.stdin(Stdio::null()).stderr(Stdio::null()).stdout(Stdio::piped());
