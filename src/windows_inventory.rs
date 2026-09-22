@@ -82,6 +82,7 @@ pub struct RegistryOrphan {
 struct RegistryCleanupResult {
     removed: usize,
     failed: Vec<String>,
+    failed_item_ids: Vec<String>,
     backup_dir: PathBuf,
     elapsed_ms: u128,
 }
@@ -94,8 +95,11 @@ pub struct WindowsInventory {
     pub task_status: String,
     pub shell_status: String,
     pub registry_status: String,
+    pub registry_cleanup_summary: String,
+    pub registry_cleanup_failures: Vec<String>,
     pub registry_scanning: bool,
     pub registry_cleaning: bool,
+    registry_cleanup_failed_item_ids: HashSet<String>,
     registry_scan_rx: Option<Receiver<Result<Vec<RegistryOrphan>, String>>>,
     registry_scan_started: Option<Instant>,
     registry_cleanup_rx: Option<Receiver<Result<RegistryCleanupResult, String>>>,
@@ -337,17 +341,37 @@ foreach ($root in $handlerRoots) {
     }
 
     pub fn scan_registry_orphans(&mut self) {
+        self.start_registry_scan(false);
+    }
+
+    fn scan_registry_orphans_after_cleanup(&mut self) {
+        self.start_registry_scan(true);
+    }
+
+    fn start_registry_scan(&mut self, preserve_cleanup: bool) {
         if self.registry_scanning {
             return;
+        }
+
+        if !preserve_cleanup {
+            self.registry_cleanup_summary.clear();
+            self.registry_cleanup_failures.clear();
+            self.registry_cleanup_failed_item_ids.clear();
         }
 
         let (tx, rx) = mpsc::channel();
         self.registry_scan_rx = Some(rx);
         self.registry_scan_started = Some(Instant::now());
         self.registry_scanning = true;
-        self.registry_status =
+        self.registry_status = if preserve_cleanup && !self.registry_cleanup_summary.is_empty() {
+            format!(
+                "{} Confirmando o resultado com uma nova varredura…",
+                self.registry_cleanup_summary
+            )
+        } else {
             "Varredura segura em andamento: verificando somente referências comprovadamente órfãs…"
-                .into();
+                .into()
+        };
         self.registry_orphans.clear();
 
         crate::diagnostics::operation_start(
@@ -355,7 +379,8 @@ foreach ($root in $handlerRoots) {
             "safe_scan",
             serde_json::json!({
                 "mode": "safe",
-                "policy": "somente referências com alvo comprovadamente inexistente"
+                "policy": "somente referências com alvo comprovadamente inexistente",
+                "post_cleanup": preserve_cleanup
             }),
         );
 
@@ -402,10 +427,23 @@ foreach ($root in $handlerRoots) {
 
         match result {
             Ok(mut items) => {
+                let mut protected_after_cleanup = 0usize;
                 for item in &mut items {
-                    item.checked = true;
+                    let failed_before = self
+                        .registry_cleanup_failed_item_ids
+                        .contains(&registry_item_id(item));
+                    item.checked = !failed_before;
                     if item.category.trim().is_empty() {
                         item.category = "Outros seguros".into();
+                    }
+                    if failed_before {
+                        protected_after_cleanup = protected_after_cleanup.saturating_add(1);
+                        item.category = "Não removidos / protegidos".into();
+                        item.reason = format!("Não removido: {}", item.reason);
+                        item.evidence = format!(
+                            "{} A tentativa anterior não teve permissão para remover esta entrada; ela ficou desmarcada para evitar repetição automática.",
+                            item.evidence
+                        );
                     }
                 }
                 items.sort_by(|a, b| {
@@ -421,11 +459,20 @@ foreach ($root in $handlerRoots) {
                     .collect::<HashSet<_>>()
                     .len();
 
-                self.registry_status = format!(
-                    "{} entrada(s) segura(s) encontrada(s) em {} categoria(s). O modo Safe marca automaticamente todos os resultados.",
-                    items.len(),
-                    categories
-                );
+                self.registry_status = if !self.registry_cleanup_summary.is_empty() {
+                    format!(
+                        "{} Confirmação: {} entrada(s) ainda presente(s); {} protegida(s)/sem permissão ficaram desmarcadas e não serão repetidas automaticamente.",
+                        self.registry_cleanup_summary,
+                        items.len(),
+                        protected_after_cleanup
+                    )
+                } else {
+                    format!(
+                        "{} entrada(s) segura(s) encontrada(s) em {} categoria(s). O modo Safe marca automaticamente os resultados removíveis.",
+                        items.len(),
+                        categories
+                    )
+                };
 
                 crate::diagnostics::operation_end(
                     "registro",
@@ -779,7 +826,19 @@ foreach ($root in $clsidRoots) {
                         }
 
                         if ($target -and (Is-LocalMissingPath $target) -and -not (Is-WindowsPath $target)) {
-                            Add-SafeItem 'ActiveX/COM' 'Key' ($root.Reg + '\' + $clsidName) '' $target ('Registro COM órfão: ' + $serverName) 'O servidor COM é caminho local absoluto, não é do Windows e o arquivo não existe.'
+                            # Safe Scan só classifica como removível o que o processo elevado
+                            # consegue abrir para escrita. Chaves protegidas por TrustedInstaller/
+                            # ACL do sistema não devem aparecer como "seguras" e entrar em loop.
+                            $writeProbe = $null
+                            $writable = $false
+                            try {
+                                $writeProbe = $base.OpenSubKey($clsidName, $true)
+                                if ($writeProbe) { $writable = $true }
+                            } catch {}
+                            if ($writeProbe) { $writeProbe.Dispose() }
+                            if (-not $writable) { continue }
+
+                            Add-SafeItem 'ActiveX/COM' 'Key' ($root.Reg + '\' + $clsidName) '' $target ('Registro COM órfão: ' + $serverName) 'O servidor COM é caminho local absoluto, não é do Windows, o arquivo não existe e a chave é gravável pelo processo elevado.'
                             break
                         }
                     } finally {
@@ -813,6 +872,10 @@ if ($items.Count -eq 0) {
         if self.registry_scanning || self.registry_cleaning {
             return;
         }
+
+        self.registry_cleanup_summary.clear();
+        self.registry_cleanup_failures.clear();
+        self.registry_cleanup_failed_item_ids.clear();
 
         let selected: Vec<RegistryOrphan> = self
             .registry_orphans
@@ -878,18 +941,25 @@ if ($items.Count -eq 0) {
         match result {
             Ok(result) => {
                 let ok = result.failed.is_empty();
-                self.registry_status = if ok {
+                self.registry_cleanup_failures = result.failed.clone();
+                self.registry_cleanup_failed_item_ids =
+                    result.failed_item_ids.iter().cloned().collect();
+                self.registry_cleanup_summary = if ok {
                     format!(
-                        "{} entrada(s) removida(s). Reanalisando o Registro para confirmar o resultado…",
+                        "Limpeza concluída: {} entrada(s) removida(s); nenhuma falha.",
                         result.removed
                     )
                 } else {
                     format!(
-                        "{} entrada(s) removida(s), {} falha(s). Reanalisando para mostrar somente o que realmente permaneceu.",
+                        "Limpeza concluída: {} entrada(s) removida(s); {} não puderam ser removida(s).",
                         result.removed,
                         result.failed.len()
                     )
                 };
+                self.registry_status = format!(
+                    "{} Reanalisando o Registro para confirmar o resultado…",
+                    self.registry_cleanup_summary
+                );
 
                 crate::diagnostics::operation_end(
                     "registro",
@@ -903,7 +973,7 @@ if ($items.Count -eq 0) {
                     }),
                 );
 
-                self.scan_registry_orphans();
+                self.scan_registry_orphans_after_cleanup();
             }
             Err(error) => {
                 self.registry_status = format!("Falha na limpeza segura do Registro: {error}");
@@ -1093,6 +1163,7 @@ fn cleanup_registry_items(
     let mut backed_up = HashSet::new();
     let mut backup_failed = HashSet::new();
     let mut failures = Vec::new();
+    let mut failed_item_ids = Vec::new();
     let mut removed = 0usize;
 
     for (index, item) in selected.iter().enumerate() {
@@ -1135,6 +1206,7 @@ fn cleanup_registry_items(
                         "{}: backup falhou, portanto a remoção foi bloqueada: {}",
                         item.reg_path, error
                     ));
+                    failed_item_ids.push(registry_item_id(item));
                     continue;
                 }
             }
@@ -1197,6 +1269,7 @@ fn cleanup_registry_items(
                         },
                         error
                     ));
+                    failed_item_ids.push(registry_item_id(item));
                 }
             }
         }
@@ -1216,9 +1289,18 @@ fn cleanup_registry_items(
     Ok(RegistryCleanupResult {
         removed,
         failed: failures,
+        failed_item_ids,
         backup_dir,
         elapsed_ms: started.elapsed().as_millis(),
     })
+}
+
+fn registry_item_id(item: &RegistryOrphan) -> String {
+    format!(
+        "{}|{}",
+        item.reg_path.to_ascii_lowercase(),
+        item.value_name.to_ascii_lowercase()
+    )
 }
 
 fn run_reg(args: &[String]) -> Result<String, String> {
