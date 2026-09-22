@@ -22,6 +22,23 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Preparar mídia embutida
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path assets | Out-Null
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/linuxhell/apocalipse-download-manager/main/apps/desktop/src-tauri/assets/about-background.jpg" -OutFile assets\about-background.jpg
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/linuxhell/apocalipse-download-manager/main/apps/desktop/src-tauri/assets/about-creator.jpg" -OutFile assets\about-creator.jpg
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/linuxhell/apocalipse-download-manager/main/apps/desktop/src-tauri/assets/about-theme.mp4" -OutFile assets\about-theme.mp4
+          if ((Get-Item assets\about-theme.mp4).Length -lt 100000) { throw "Falha ao obter a musica da secao Sobre" }
+          $ffmpeg = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+          if (-not $ffmpeg) {
+            choco install ffmpeg -y --no-progress
+            $ffmpeg = Get-Command ffmpeg.exe -ErrorAction Stop
+          }
+          & $ffmpeg.Source -y -i assets\about-theme.mp4 -vn -codec:a libmp3lame -b:a 128k assets\about-theme.mp3
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path assets\about-theme.mp3)) { throw "Falha ao preparar MP3 embutido da secao Sobre" }
+          if ((Get-Item assets\about-theme.mp3).Length -lt 100000) { throw "MP3 embutido da secao Sobre invalido" }
+
       - name: Compilar release
         run: cargo build --release --target x86_64-pc-windows-msvc
 
@@ -34,7 +51,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\config | Out-Null
           New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\backups | Out-Null
           New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\logs | Out-Null
-          Set-Content -Encoding UTF8 dist\Apocalipse-Faxina\data\LEIA-ME.txt "Coloque winapp2.ini nesta pasta para carregar as regras Winapp2."
+          New-Item -ItemType Directory -Force -Path dist\Apocalipse-Faxina\assets | Out-Null
+          Copy-Item assets\about-background.jpg dist\Apocalipse-Faxina\assets\about-background.jpg
+          Copy-Item assets\about-creator.jpg dist\Apocalipse-Faxina\assets\about-creator.jpg
+          Copy-Item assets\about-theme.mp4 dist\Apocalipse-Faxina\assets\about-theme.mp4
+          Copy-Item assets\about-theme.mp3 dist\Apocalipse-Faxina\assets\about-theme.mp3
+          Set-Content -Encoding UTF8 dist\Apocalipse-Faxina\data\LEIA-ME.txt "Coloque winapp2.ini nesta pasta para carregar as regras Winapp2, ou selecione outro arquivo dentro do programa."
 
       - name: Artefato Windows x64 portátil
         uses: actions/upload-artifact@v4

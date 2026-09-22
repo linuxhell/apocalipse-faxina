@@ -69,9 +69,22 @@ fn make_icon(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 fn main() {
-    #[cfg(windows)]
-    {
-        let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let source_audio = manifest_dir.join("assets").join("about-theme.mp3");
+    let embedded_audio = out.join("about-theme.mp3");
+
+    println!("cargo:rerun-if-changed={}", source_audio.display());
+    if source_audio.is_file() {
+        fs::copy(&source_audio, &embedded_audio)
+            .expect("falha ao copiar about-theme.mp3 para recurso embutido");
+    } else {
+        fs::write(&embedded_audio, [])
+            .expect("falha ao criar placeholder do audio embutido");
+        println!("cargo:warning=about-theme.mp3 ausente; build sera gerado sem trilha embutida");
+    }
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let icon = out.join("apocalipse-faxina.ico");
         make_icon(&icon).expect("falha ao gerar icone");
         let mut res = winresource::WindowsResource::new();
@@ -80,6 +93,23 @@ fn main() {
         res.set("ProductName", "Apocalipse Faxina");
         res.set("CompanyName", "linuxhell");
         res.set("LegalCopyright", "linuxhell");
+        res.set_manifest(r#"
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <supportedOS Id="{4f476546-937c-4f91-bd50-8c82b245de47}"/>
+    </application>
+  </compatibility>
+</assembly>
+"#);
         res.compile().expect("falha ao compilar recursos do Windows");
     }
 }
