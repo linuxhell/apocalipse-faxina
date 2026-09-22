@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver},
         Mutex, OnceLock,
     },
@@ -20,6 +20,7 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 static LOGGER: OnceLock<DiagnosticLogger> = OnceLock::new();
+static SUPPRESS_NEXT_UI_STALL: AtomicBool = AtomicBool::new(false);
 
 pub struct DiagnosticLogger {
     root: PathBuf,
@@ -185,7 +186,14 @@ pub fn ui_click(section: &str, x: f32, y: f32, secondary: bool) {
     );
 }
 
+pub fn suppress_next_ui_stall() {
+    SUPPRESS_NEXT_UI_STALL.store(true, Ordering::Relaxed);
+}
+
 pub fn frame_finished(section: &str, elapsed_ms: u128) {
+    if SUPPRESS_NEXT_UI_STALL.swap(false, Ordering::Relaxed) {
+        return;
+    }
     if elapsed_ms >= 350 {
         event(
             "ui_stall",

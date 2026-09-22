@@ -1974,7 +1974,23 @@ impl FaxinaApp {
         }
 
         ui.label(&self.inventory.registry_status);
-        ui.small("Todos os resultados do Safe vêm marcados. Cada chave/valor é exportado para .reg antes da remoção; o scanner nunca apaga os arquivos apontados.");
+        if !self.inventory.registry_cleanup_failures.is_empty() {
+            egui::CollapsingHeader::new(format!(
+                "Itens não removidos ({})",
+                self.inventory.registry_cleanup_failures.len()
+            ))
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.small("Essas entradas não foram removidas. Elas ficam fora da repetição automática para evitar loop.");
+                for failure in &self.inventory.registry_cleanup_failures {
+                    ui.small(
+                        egui::RichText::new(format!("• {}", failure))
+                            .color(t.muted),
+                    );
+                }
+            });
+        }
+        ui.small("Os resultados removíveis do Safe vêm marcados. Cada chave/valor é exportado para .reg antes da remoção; entradas sem permissão ficam desmarcadas após a tentativa e o scanner nunca apaga os arquivos apontados.");
         ui.separator();
 
         egui::ScrollArea::vertical()
@@ -3148,6 +3164,7 @@ fn normalize_drive_target(value: &str) -> Option<String> {
 
 #[cfg(windows)]
 fn run_picker_script(script: &str) -> Option<PathBuf> {
+    diagnostics::suppress_next_ui_stall();
     let mut command = Command::new("powershell.exe");
     command.args(["-NoProfile", "-STA", "-Command", script]);
     command.stdin(Stdio::null()).stderr(Stdio::null()).stdout(Stdio::piped());

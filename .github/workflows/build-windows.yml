@@ -82,12 +82,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view v0.2.0 --repo "$env:GITHUB_REPOSITORY" *> $null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "Release v0.2.0 ja existe; nenhuma nova publicacao necessaria."
-            exit 0
-          }
-
           @"
           Primeira versão pública do Apocalipse Faxina, utilitário portátil de manutenção, limpeza, diagnóstico e otimização para Windows x64, com foco em análise antes da ação, exclusões globais, backups e operações reversíveis sempre que possível.
 
@@ -103,7 +97,7 @@ jobs:
           - WinSxS usando mecanismos oficiais do Windows.
           - Discos/SSD com múltiplos modos de otimização e relatórios antes/depois.
           - Gerenciamento de Driver Store.
-          - Safe Scan do Registro com backup.
+          - Safe Scan do Registro com backup, resumo de removidos/falhas e proteção contra loop em chaves sem permissão.
           - Inicialização, tarefas agendadas, serviços e menu de contexto.
           - Reparo do Windows e da Internet com diagnóstico e backup de rede.
           - Sistema de diagnóstico/debug estruturado.
@@ -112,4 +106,17 @@ jobs:
           - Link de doação PayPal.
           "@ | Set-Content -Encoding UTF8 release-notes.md
 
-          gh release create v0.2.0 "Apocalipse-Faxina-Windows-x64-v0.2.0.zip" --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" --title "Apocalipse Faxina v0.2.0" --notes-file release-notes.md
+          gh release view v0.2.0 --repo "$env:GITHUB_REPOSITORY" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/v0.2.0" -f sha="$env:GITHUB_SHA" -F force=true
+            if ($LASTEXITCODE -ne 0) { throw "Falha ao atualizar a tag v0.2.0 para o build corrigido." }
+
+            gh release upload v0.2.0 "Apocalipse-Faxina-Windows-x64-v0.2.0.zip" --repo "$env:GITHUB_REPOSITORY" --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Falha ao substituir o ZIP do release v0.2.0." }
+
+            gh release edit v0.2.0 --repo "$env:GITHUB_REPOSITORY" --title "Apocalipse Faxina v0.2.0" --notes-file release-notes.md
+            if ($LASTEXITCODE -ne 0) { throw "Falha ao atualizar as notas do release v0.2.0." }
+          } else {
+            gh release create v0.2.0 "Apocalipse-Faxina-Windows-x64-v0.2.0.zip" --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" --title "Apocalipse Faxina v0.2.0" --notes-file release-notes.md
+            if ($LASTEXITCODE -ne 0) { throw "Falha ao criar o release v0.2.0." }
+          }
